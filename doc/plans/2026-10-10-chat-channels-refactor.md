@@ -54,6 +54,22 @@ needs a narrow callback contract; candidate 5 must preserve the same service
 lifetime for registration and in-flight promises. Candidates are sequential,
 not independent concurrent changes to this file.
 
+## Provider folder convention (2026-10-11)
+
+Provider-specific code belongs under `chat-channels/<provider>/`, using the
+existing provider identifiers. The normalization extraction now lives in
+`telegram/messages.ts`, `slack/messages.ts`, `discord/messages.ts`,
+`microsoft-teams/messages.ts` and `github/messages.ts`. Shared actor normalization,
+actor data and the inbound text limit live in `message-lifecycle.ts`. The service
+imports the provider modules directly. Future extractions should follow this
+layout; move older flat provider modules when their responsibility is touched.
+
+All 22 declarations retain their exact bodies. The service changes imports only.
+The same 48 provider integration cases passed before and after this move, and
+server typecheck and module boundaries pass. The historical extraction sizes
+below predate this folder change: direct imports add 10 service lines / 281 bytes.
+The six message modules now total 566 lines / 19,534 bytes, including imports.
+
 ## Verification and progress
 
 Before the production move, run existing service integration cases for message

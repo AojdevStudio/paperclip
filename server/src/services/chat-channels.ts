@@ -1,12 +1,10 @@
 import {
   MAX_INBOUND_TEXT,
   stableExternalPrincipalId,
-  type GitHubLifecycleEvent,
   type LifecycleActor,
   lifecycleActorFromAuthor,
-  slackLifecycleFilesDigest,
-  discordLifecycleFilesDigest,
-  microsoftTeamsLifecycleEventFromPayload,
+} from "./chat-channels/message-lifecycle.js";
+import {
   telegramLifecycleEventFromPayload,
   isTelegramEditedMessageRaw,
   isTelegramMigrationRaw,
@@ -15,10 +13,22 @@ import {
   telegramZeroMessageId,
   telegramDeliveryHasZeroMessageId,
   telegramMessageSentAt,
+} from "./chat-channels/telegram/messages.js";
+import {
+  slackLifecycleFilesDigest,
   slackMessageSentAt,
+} from "./chat-channels/slack/messages.js";
+import {
+  discordLifecycleFilesDigest,
+} from "./chat-channels/discord/messages.js";
+import {
+  microsoftTeamsLifecycleEventFromPayload,
   teamsActivitySentAt,
+} from "./chat-channels/microsoft-teams/messages.js";
+import {
+  type GitHubLifecycleEvent,
   githubLifecycleEventFromRequest,
-} from "./chat-channels/provider-messages.js";
+} from "./chat-channels/github/messages.js";
 import { dueChatAction, nextChatActionAt, SLACK_COMMAND_POST_STALE_MS, SLACK_COMMAND_EXPLICIT_RETRY_STALE_MS, SLACK_COMMAND_ADMISSION_STALE_MS, PROVIDER_EFFECT_STALE_MS } from "./chat-action-work.js";
 import type { ScheduledChatAction } from "./chat-work-notifications.js";
 import { notifyChatDeliveryWork, notifyChatPublicationWork, notifyChatEndpointWork, notifyChatActionWork, notifyChatVerificationWork } from "./chat-work-notifications.js";
