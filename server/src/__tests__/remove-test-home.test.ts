@@ -66,7 +66,11 @@ describe("removeTestHome", () => {
     expect(() => removeTestHome(home)).not.toThrow();
   });
 
-  it("does not follow a symlink out of the home while making directories writable", () => {
+  // Windows keeps no Unix mode bits (chmod only toggles the read-only
+  // attribute, so the 0o555 assertion cannot hold) and a directory symlink
+  // can need elevated privileges there. POSIX-only, like the suite's other
+  // permission tests.
+  it.skipIf(process.platform === "win32")("does not follow a symlink out of the home while making directories writable", () => {
     const home = makeHome();
     const outside = makeHome();
     const guarded = path.join(outside, "guarded");
