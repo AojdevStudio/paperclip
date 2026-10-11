@@ -22,6 +22,15 @@
 // different platform, an edit that landed while the build was running. The
 // slow direction is always the safe one.
 //
+// Each build chain has its own pending record, so two Runner builds running
+// at once in one checkout (server `build` and `typecheck` side by side, say)
+// do not consume each other's: `--begin` and `--finish` are separate
+// processes, and what they share is the shell pnpm runs the chain in, so the
+// record is keyed by that shell's pid. Both builds write the same dist, which
+// the stamp cannot make safe; what it does guarantee is that a stamp is
+// written only by a build whose own inputs did not move, and that the other
+// build's `--finish` drops the stamp if its inputs did.
+//
 // Inputs: every file under packages/paperclip-runner except its build outputs
 // (dist, dist-browser, runner/target), node_modules and dot-directories (tool
 // caches); every file under packages/paperclip-eval-kernel except dist and
@@ -81,9 +90,65 @@ export function buildInputsStampPath(packageRoot) {
   return path.join(packageRoot, "node_modules", ".cache", "paperclip-runner-build-inputs.json");
 }
 
-/** Written by `--begin`, consumed by `--finish`; its presence means a build is (or was) in progress. */
-export function buildInputsPendingPath(packageRoot) {
-  return path.join(packageRoot, "node_modules", ".cache", "paperclip-runner-build-inputs.pending.json");
+/** One record per build in progress, written by `--begin` and consumed by that build's `--finish`. */
+export function buildInputsPendingDirectory(packageRoot) {
+  return path.join(packageRoot, "node_modules", ".cache", "paperclip-runner-build-inputs.pending");
+}
+
+export function buildInputsPendingPath(packageRoot, buildId) {
+  return path.join(buildInputsPendingDirectory(packageRoot), `${buildId}.json`);
+}
+
+/**
+ * A pending record older than this belongs to a build that never reached
+ * `--finish` (a failed step, an interrupted build); `--begin` removes such
+ * records so they cannot pile up. No Runner build runs anywhere near this long.
+ */
+export const PENDING_RECORD_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Identifies the build chain a `--begin` or `--finish` process belongs to.
+ * The two are separate processes; what they share is the shell pnpm runs the
+ * chain in, so the chain is named after its pid, which `--begin` sees as its
+ * parent. A shell that execs the last command of a `-c` string (bash can)
+ * turns `--finish` into the shell itself, so `--finish` also accepts a record
+ * named after its own pid.
+ */
+export function currentBuildId() {
+  return String(process.ppid);
+}
+
+function finishingBuildIds() {
+  return [String(process.ppid), String(process.pid)];
+}
+
+function readPendingRecord(pendingPath) {
+  const pending = readBuildInputsStamp(pendingPath);
+  if (!pending || pending.schema !== BUILD_INPUTS_SCHEMA || typeof pending.digest !== "string") return null;
+  return pending;
+}
+
+/** Drops pending records of builds that never finished, leaving the one for `buildId`. */
+function prunePendingRecords(packageRoot, buildId, now) {
+  const directory = buildInputsPendingDirectory(packageRoot);
+  let entries;
+  try {
+    entries = readdirSync(directory);
+  } catch {
+    return;
+  }
+  const cutoff = now().getTime() - PENDING_RECORD_MAX_AGE_MS;
+  for (const name of entries) {
+    if (name === `${buildId}.json`) continue;
+    const absolute = path.join(directory, name);
+    let stat;
+    try {
+      stat = lstatSync(absolute);
+    } catch {
+      continue;
+    }
+    if (stat.mtimeMs < cutoff) rmSync(absolute, { force: true });
+  }
 }
 
 /**
@@ -223,12 +288,14 @@ export function beginRunnerBuild({
   packageRoot,
   platform = process.platform,
   arch = process.arch,
+  buildId = currentBuildId(),
   now = () => new Date(),
 }) {
   removeBuildInputsStamp(buildInputsStampPath(packageRoot));
+  prunePendingRecords(packageRoot, buildId, now);
   const inputs = computeBuildInputsDigest(repoRoot);
-  const pending = { ...inputs, platform, arch, startedAt: now().toISOString() };
-  const pendingPath = buildInputsPendingPath(packageRoot);
+  const pending = { ...inputs, platform, arch, buildId, startedAt: now().toISOString() };
+  const pendingPath = buildInputsPendingPath(packageRoot, buildId);
   writeBuildInputsStamp(pendingPath, pending);
   return { ...pending, pendingPath };
 }
@@ -239,22 +306,31 @@ export function beginRunnerBuild({
  * the outputs now under dist. An edit that landed while the build ran means
  * the outputs may not reflect the current inputs, so nothing is recorded and
  * the next consumer rebuilds. A build that did not begin with
- * `beginRunnerBuild`, or that left a required output missing, is an error.
+ * `beginRunnerBuild` (no pending record for this build chain), or that left
+ * a required output missing, is an error.
  */
 export function recordRunnerBuild({
   repoRoot,
   packageRoot,
   platform = process.platform,
   arch = process.arch,
+  buildId = null,
   now = () => new Date(),
 }) {
   const stampPath = buildInputsStampPath(packageRoot);
-  const pendingPath = buildInputsPendingPath(packageRoot);
-  const pending = readBuildInputsStamp(pendingPath);
-  if (!pending || pending.schema !== BUILD_INPUTS_SCHEMA || typeof pending.digest !== "string") {
+  const candidates = buildId === null ? finishingBuildIds() : [String(buildId)];
+  let pending = null;
+  let pendingPath = null;
+  for (const candidate of candidates) {
+    pendingPath = buildInputsPendingPath(packageRoot, candidate);
+    pending = readPendingRecord(pendingPath);
+    if (pending) break;
+  }
+  if (!pending) {
     removeBuildInputsStamp(stampPath);
     throw new Error(
-      `no pending build inputs at ${pendingPath}: the Runner build must start with ` +
+      `no pending build inputs for build ${candidates.join(" or ")} under ` +
+        `${buildInputsPendingDirectory(packageRoot)}: the Runner build must start with ` +
         "`node scripts/record-build-inputs.mjs --begin` before it can record its result",
     );
   }

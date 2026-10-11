@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, readFile, rm, stat, symlink, truncate, writeFile } from "node:fs/promises";
+import { existsSync, readdirSync } from "node:fs";
+import { mkdtemp, mkdir, readdir, readFile, rm, stat, symlink, truncate, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -8,13 +9,16 @@ import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import {
   BUILD_INPUTS_SCHEMA,
+  PENDING_RECORD_MAX_AGE_MS,
   assessRunnerBuild,
   beginRunnerBuild,
+  buildInputsPendingDirectory,
   buildInputsPendingPath,
   buildInputsStampPath,
   collectBuildInputFiles,
   collectBuildOutputFiles,
   computeBuildInputsDigest,
+  currentBuildId,
   expectedBuildOutputs,
   readBuildInputsStamp,
   recordRunnerBuild,
@@ -22,6 +26,32 @@ import {
 
 const execFileAsync = promisify(execFile);
 const recordScript = fileURLToPath(new URL("./record-build-inputs.mjs", import.meta.url));
+/** A child of this process names its build after this process, as `--begin` names it after the shell. */
+const childBuildId = String(process.pid);
+
+async function waitFor(condition, label, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
+/**
+ * The whole build chain the way pnpm runs it: one shell, `--begin` first,
+ * `--finish` last, with a stand-in for the build steps that waits for a
+ * marker file so two chains can be held open at the same time.
+ */
+function runChainInShell(shell, packageRoot, marker) {
+  const quote = (value) => `'${value.replace(/'/g, `'\\''`)}'`;
+  const wait =
+    `${quote(process.execPath)} -e ${quote(
+      "const fs=require('node:fs');const [marker]=process.argv.slice(1);const deadline=Date.now()+10000;" +
+        "(function poll(){if(fs.existsSync(marker))return;if(Date.now()>deadline)process.exit(3);setTimeout(poll,20)})()",
+    )} ${quote(marker)}`;
+  const phase = (flag) => `${quote(process.execPath)} ${quote(recordScript)} ${flag} --package-root ${quote(packageRoot)}`;
+  return execFileAsync(shell, ["-c", `${phase("--begin")} && ${wait} && ${phase("--finish")}`]);
+}
 
 async function writeTree(root, files) {
   for (const [relative, content] of Object.entries(files)) {
@@ -253,7 +283,7 @@ test("a build is current only with a matching stamp and every recorded output in
 test("an input edited while the build runs leaves no stamp, so the next consumer rebuilds", async () => {
   await withRepo(async ({ repoRoot, packageRoot }) => {
     const stampPath = buildInputsStampPath(packageRoot);
-    const pendingPath = buildInputsPendingPath(packageRoot);
+    const pendingPath = buildInputsPendingPath(packageRoot, currentBuildId());
     const assess = () => assessRunnerBuild({ repoRoot, packageRoot });
 
     // A previous good build, then a new build begins: the old stamp is gone at
@@ -262,8 +292,10 @@ test("an input edited while the build runs leaves no stamp, so the next consumer
     assert.equal(assess().current, true);
     const pending = beginRunnerBuild({ repoRoot, packageRoot, now: () => new Date(1000) });
     assert.equal(pending.pendingPath, pendingPath);
+    assert.equal(pending.buildId, String(process.ppid), "a build is named after the shell that runs its chain");
     assert.equal(readBuildInputsStamp(stampPath), null, "the old stamp survived the start of a new build");
     assert.equal(readBuildInputsStamp(pendingPath).digest, pending.digest);
+    assert.equal(readBuildInputsStamp(pendingPath).buildId, pending.buildId);
     assert.equal(assess().code, "no_stamp");
 
     // The build "compiles" the old source, then an edit lands before it ends.
@@ -293,9 +325,23 @@ test("a build that did not begin, or that left a required output missing, cannot
     recordCurrentBuild({ repoRoot, packageRoot });
     assert.throws(
       () => recordRunnerBuild({ repoRoot, packageRoot }),
-      /no pending build inputs at .*paperclip-runner-build-inputs\.pending\.json: the Runner build must start with `node scripts\/record-build-inputs\.mjs --begin`/,
+      new RegExp(
+        `no pending build inputs for build ${process.ppid} or ${process.pid} under .*paperclip-runner-build-inputs\\.pending: ` +
+          "the Runner build must start with `node scripts/record-build-inputs\\.mjs --begin`",
+      ),
     );
     assert.equal(readBuildInputsStamp(stampPath), null, "the previous stamp outlived a build that did not begin");
+
+    // Another build's record is not this build's: a chain that did not begin
+    // cannot finish on the strength of one that is still running.
+    beginRunnerBuild({ repoRoot, packageRoot, buildId: "other-shell" });
+    assert.throws(() => recordRunnerBuild({ repoRoot, packageRoot }), /no pending build inputs for build /);
+    assert.equal(
+      readBuildInputsStamp(buildInputsPendingPath(packageRoot, "other-shell")).digest,
+      computeBuildInputsDigest(repoRoot).digest,
+      "a build that did not begin consumed another build's record",
+    );
+    await rm(buildInputsPendingPath(packageRoot, "other-shell"));
 
     beginRunnerBuild({ repoRoot, packageRoot });
     await rm(path.join(packageRoot, "dist", "testing.js"));
@@ -320,7 +366,7 @@ test("record-build-inputs.mjs brackets the build for the package it is pointed a
 
     const begin = await run("--begin");
     assert.match(begin.stdout, new RegExp(`^${BUILD_INPUTS_SCHEMA} begin: digest=${short} files=${INPUT_FILE_COUNT} bytes=\\d+\n$`));
-    assert.equal(readBuildInputsStamp(buildInputsPendingPath(packageRoot)).digest, expected.digest);
+    assert.equal(readBuildInputsStamp(buildInputsPendingPath(packageRoot, childBuildId)).digest, expected.digest);
 
     const finish = await run("--finish");
     assert.match(
@@ -348,5 +394,140 @@ test("record-build-inputs.mjs brackets the build for the package it is pointed a
       execFileAsync(process.execPath, [recordScript, "--begin", "--bogus"]),
       /unknown argument --bogus/,
     );
+  });
+});
+
+test("two builds running at once in one checkout each keep their own pending record", async () => {
+  await withRepo(async ({ repoRoot, packageRoot }) => {
+    const stampPath = buildInputsStampPath(packageRoot);
+    const pendingDirectory = buildInputsPendingDirectory(packageRoot);
+    const first = { repoRoot, packageRoot, buildId: "shell-1" };
+    const second = { repoRoot, packageRoot, buildId: "shell-2" };
+    const digestNow = () => computeBuildInputsDigest(repoRoot).digest;
+
+    // Nothing changes: both builds record, in either finishing order, and the
+    // second to finish does not fail for want of a record.
+    beginRunnerBuild(first);
+    beginRunnerBuild(second);
+    assert.deepEqual((await readdir(pendingDirectory)).sort(), ["shell-1.json", "shell-2.json"]);
+    assert.equal(recordRunnerBuild(first).recorded, true);
+    assert.deepEqual(await readdir(pendingDirectory), ["shell-2.json"], "the first finish consumed the wrong record");
+    assert.equal(readBuildInputsStamp(stampPath).digest, digestNow());
+    assert.equal(recordRunnerBuild(second).recorded, true);
+    assert.deepEqual(await readdir(pendingDirectory), []);
+    assert.equal(assessRunnerBuild({ repoRoot, packageRoot }).current, true);
+
+    beginRunnerBuild(first);
+    beginRunnerBuild(second);
+    assert.equal(recordRunnerBuild(second).recorded, true);
+    assert.equal(recordRunnerBuild(first).recorded, true);
+    assert.equal(assessRunnerBuild({ repoRoot, packageRoot }).current, true);
+
+    // An edit lands between the two starts. The build that began before it
+    // must not leave a stamp whichever of the two finishes last: a stamp means
+    // every build that wrote dist read the inputs it names.
+    const source = path.join(packageRoot, "src", "index.ts");
+    beginRunnerBuild(first);
+    await writeFile(source, "export const one = 2;\n");
+    beginRunnerBuild(second);
+    const staleFirst = recordRunnerBuild(first);
+    assert.equal(staleFirst.recorded, false);
+    assert.equal(staleFirst.code, "inputs_changed_during_build");
+    assert.equal(readBuildInputsStamp(stampPath), null);
+    assert.equal(recordRunnerBuild(second).recorded, true, "the build that read the edited inputs was not recorded");
+    assert.equal(assessRunnerBuild({ repoRoot, packageRoot }).current, true);
+
+    beginRunnerBuild(first);
+    await writeFile(source, "export const one = 3;\n");
+    beginRunnerBuild(second);
+    assert.equal(recordRunnerBuild(second).recorded, true);
+    assert.equal(readBuildInputsStamp(stampPath).digest, digestNow());
+    const staleLast = recordRunnerBuild(first);
+    assert.equal(staleLast.recorded, false);
+    assert.equal(staleLast.code, "inputs_changed_during_build");
+    assert.equal(readBuildInputsStamp(stampPath), null, "a build that began before the edit left the other build's stamp standing");
+    assert.equal(assessRunnerBuild({ repoRoot, packageRoot }).code, "no_stamp");
+    assert.deepEqual(await readdir(pendingDirectory), []);
+  });
+});
+
+test("a build's start drops the pending records of builds that never finished, and no others", async () => {
+  await withRepo(async ({ repoRoot, packageRoot }) => {
+    const pendingDirectory = buildInputsPendingDirectory(packageRoot);
+    const now = new Date("2026-10-11T22:00:00.000Z");
+    const age = async (buildId, ageMs) => {
+      const moment = new Date(now.getTime() - ageMs);
+      await utimes(buildInputsPendingPath(packageRoot, buildId), moment, moment);
+    };
+
+    // A build that failed a step yesterday, one that failed a minute ago, and
+    // one still running, all left records; a new build starts.
+    beginRunnerBuild({ repoRoot, packageRoot, buildId: "crashed-yesterday", now: () => now });
+    await age("crashed-yesterday", PENDING_RECORD_MAX_AGE_MS + 60_000);
+    beginRunnerBuild({ repoRoot, packageRoot, buildId: "crashed-just-now", now: () => now });
+    await age("crashed-just-now", 60_000);
+    beginRunnerBuild({ repoRoot, packageRoot, buildId: "still-running", now: () => now });
+    await writeFile(path.join(pendingDirectory, "notes.txt"), "not a record\n");
+    await age("still-running", 0);
+
+    beginRunnerBuild({ repoRoot, packageRoot, buildId: "new-build", now: () => now });
+    assert.deepEqual(
+      (await readdir(pendingDirectory)).sort(),
+      ["crashed-just-now.json", "new-build.json", "notes.txt", "still-running.json"],
+      "pruning removed the wrong records",
+    );
+
+    // The running build and the new one still finish on their own records.
+    assert.equal(recordRunnerBuild({ repoRoot, packageRoot, buildId: "still-running" }).recorded, true);
+    assert.equal(recordRunnerBuild({ repoRoot, packageRoot, buildId: "new-build" }).recorded, true);
+    // A record that fell out of the directory is simply absent.
+    await rm(pendingDirectory, { recursive: true, force: true });
+    beginRunnerBuild({ repoRoot, packageRoot, buildId: "after-wipe" });
+    assert.deepEqual(await readdir(pendingDirectory), ["after-wipe.json"]);
+  });
+});
+
+test("two chains run by separate shells at the same time both record", { skip: process.platform === "win32" }, async () => {
+  await withRepo(async ({ repoRoot, packageRoot }) => {
+    const pendingDirectory = buildInputsPendingDirectory(packageRoot);
+    const marker = path.join(repoRoot, "release-the-chains");
+    const records = () => (existsSync(pendingDirectory) ? readdirSync(pendingDirectory).sort() : []);
+
+    const first = runChainInShell("sh", packageRoot, marker);
+    await waitFor(() => records().length === 1, "the first chain's record");
+    const second = runChainInShell("sh", packageRoot, marker);
+    await waitFor(() => records().length === 2, "the second chain's record");
+    const [firstId, secondId] = records().map((name) => name.replace(/\.json$/, ""));
+    assert.notEqual(firstId, secondId);
+    for (const id of [firstId, secondId]) {
+      assert.match(id, /^\d+$/, "a chain's record is named after its shell's pid");
+      assert.equal(readBuildInputsStamp(buildInputsPendingPath(packageRoot, id)).buildId, id);
+    }
+
+    await writeFile(marker, "go\n");
+    const results = await Promise.all([first, second]);
+    for (const result of results) {
+      assert.match(result.stdout, new RegExp(`${BUILD_INPUTS_SCHEMA} begin: `));
+      assert.match(result.stdout, new RegExp(`${BUILD_INPUTS_SCHEMA} recorded: `), "a chain finished without recording");
+    }
+    assert.deepEqual(records(), []);
+    assert.equal(assessRunnerBuild({ repoRoot, packageRoot }).current, true);
+
+    // The same chain under bash, which may exec its last command: `--finish`
+    // is then the shell itself and still finds the record `--begin` wrote.
+    let bash;
+    try {
+      bash = (await execFileAsync("bash", ["-c", "echo ok"])).stdout.trim() === "ok";
+    } catch {
+      bash = false;
+    }
+    if (bash) {
+      await rm(marker);
+      const chain = runChainInShell("bash", packageRoot, marker);
+      await waitFor(() => records().length === 1, "the bash chain's record");
+      await writeFile(marker, "go\n");
+      assert.match((await chain).stdout, new RegExp(`${BUILD_INPUTS_SCHEMA} recorded: `));
+      assert.deepEqual(records(), []);
+    }
   });
 });
