@@ -18,10 +18,12 @@ const issueId = run.contextSnapshot.issueId;
 const issue = await api(`/issues/${issueId}`);
 assert.equal(run.contextSnapshot.paperclipIssue.id, issue.id);
 assert.equal(run.contextSnapshot.paperclipIssue.description, issue.description);
-assert(run.contextSnapshot.paperclipTaskMarkdown.includes(issue.description));
-assert(run.contextSnapshot.paperclipTaskMarkdownAssignment.includes(issue.description));
-assert(!run.contextSnapshot.paperclipTaskMarkdownCompact.includes(issue.description));
-assert(!run.contextSnapshot.paperclipTaskMarkdownAssignmentCompact.includes(issue.description));
+// The fixture's title equals its description; compact prompts keep the title.
+const descriptionSection = `\nIssue description:\n\`\`\`text\n${issue.description}\n\`\`\``;
+assert(run.contextSnapshot.paperclipTaskMarkdown.includes(descriptionSection));
+assert(run.contextSnapshot.paperclipTaskMarkdownAssignment.includes(descriptionSection));
+assert(!run.contextSnapshot.paperclipTaskMarkdownCompact.includes(descriptionSection));
+assert(!run.contextSnapshot.paperclipTaskMarkdownAssignmentCompact.includes(descriptionSection));
 assert.equal(run.contextSnapshot.paperclipTurnContext.assignment.description.revision,
   createHash("sha256").update(issue.description.trim()).digest("hex"));
 const repositories = await readdir(path.join(process.cwd(), ".paperclip-repositories"));
