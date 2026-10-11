@@ -891,23 +891,6 @@ export async function prepareHeartbeatWorkspace(db: Db, input: HeartbeatWorkspac
       agentId: agent.id, runId: run.id, responsibleUserId });
     projectRepositoryPaths.push(...taskRepositories.map(repository => repository.relativePath));
   }
-  if (!isDotRun && issueId && (persistedNativeExecutionInput || nativeRecoveryExecutionWorkspaceId)) {
-    const workspaceId = persistedNativeExecutionInput?.binding.executionWorkspaceId ?? nativeRecoveryExecutionWorkspaceId!;
-    const reference = readNativeWorkspaceSyncReference(parseObject(run.runnerProfileJson).nativeWorkspaceSync);
-    if (!reference && selectedEnvironmentForConfig?.driver !== "local") {
-      throw new Error("native_workspace_sync_descriptor_binding_missing");
-    }
-    // Recovery keeps admitted files and trust even when the task now selects
-    // another workspace. Reserve only; never acquire newly requested repositories.
-    const cwd = reference
-      ? await readNativeWorkspaceSyncLocalCwd({ companyId: agent.companyId, runId: run.id, workspaceId, reference })
-      : persistedNativeExecutionInput && persistedNativeExecutionInput.schema !== "paperclip.native-execution-input.v6"
-        && selectedEnvironmentForConfig?.driver === "local"
-        ? persistedNativeExecutionInput.workspace.cwd
-        : executionWorkspace.cwd;
-    await executionWorkspacesSvc.reserveTaskRepositoryRootForRecovery({ companyId: agent.companyId,
-      issueId, workspaceId, cwd, agentId: agent.id, runId: run.id });
-  }
   if (persistedExecutionWorkspace) {
     context.executionWorkspaceId = persistedExecutionWorkspace.id;
     await db
@@ -1070,6 +1053,26 @@ export async function prepareHeartbeatWorkspace(db: Db, input: HeartbeatWorkspac
   await bindIssueToPersistedExecutionWorkspace(persistedExecutionWorkspace);
   const workspaceRealization = realizationResult.workspaceRealization;
   const executionTarget = realizationResult.executionTarget;
+  // SSH uses its remote filesystem directly; only local and sandbox runs
+  // expose or transfer the host root protected by repository reservations.
+  if (!isDotRun && issueId && (persistedNativeExecutionInput || nativeRecoveryExecutionWorkspaceId)
+      && !(executionTarget?.kind === "remote" && executionTarget.transport === "ssh")) {
+    const workspaceId = persistedNativeExecutionInput?.binding.executionWorkspaceId ?? nativeRecoveryExecutionWorkspaceId!;
+    const reference = readNativeWorkspaceSyncReference(parseObject(run.runnerProfileJson).nativeWorkspaceSync);
+    if (!reference && executionTarget?.kind === "remote" && executionTarget.transport === "sandbox") {
+      throw new Error("native_workspace_sync_descriptor_binding_missing");
+    }
+    // Recovery keeps admitted files and trust even when the task now selects
+    // another workspace. Reserve only; never acquire newly requested repositories.
+    const cwd = reference
+      ? await readNativeWorkspaceSyncLocalCwd({ companyId: agent.companyId, runId: run.id, workspaceId, reference })
+      : persistedNativeExecutionInput && persistedNativeExecutionInput.schema !== "paperclip.native-execution-input.v6"
+        && executionTarget?.kind !== "remote"
+        ? persistedNativeExecutionInput.workspace.cwd
+        : executionWorkspace.cwd;
+    await executionWorkspacesSvc.reserveTaskRepositoryRootForRecovery({ companyId: agent.companyId,
+      issueId, workspaceId, cwd, agentId: agent.id, runId: run.id });
+  }
   // Preserve the host-owned source before adapter context can share lease
   // metadata. A later copy-back failure must not adopt a rebound source.
   const workspaceRestoreSource = structuredClone(realizationResult.lease);

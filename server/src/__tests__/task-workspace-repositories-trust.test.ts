@@ -2,6 +2,7 @@ import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
 import { mkdtemp, mkdir, writeFile, readFile, realpath, rm, symlink } from "node:fs/promises";
+import fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -9,6 +10,8 @@ import { eq } from "drizzle-orm";
 import { agents, authUsers, companies, companyMemberships, createDb, executionWorkspaceRepositoryRoots, executionWorkspaceRepositories, executionWorkspaces,
   heartbeatRuns, issues, projects, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
 import { executionWorkspaceRepositoryService } from "../services/execution-workspace-repositories.js";
+import { buildNativeExecutionInput } from "../services/native-runtime/native-execution-input.js";
+import { nativeRuntimeContextFixture } from "../services/native-runtime/runtime-context.test-fixture.js";
 import { buildGitAuthInvocation } from "../services/git-credentials.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
@@ -33,7 +36,7 @@ const support = await getEmbeddedPostgresTestSupport();
     db = createDb(database.connectionString);
     root = await mkdtemp(path.join(tmpdir(), "paperclip-repository-trust-"));
   }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
-  afterEach(() => { vi.clearAllMocks(); });
+  afterEach(() => { vi.clearAllMocks(); vi.restoreAllMocks(); });
   afterAll(async () => { await database?.cleanup(); if (root) await rm(root, { recursive: true, force: true }); });
 
   async function fixture() {
@@ -194,6 +197,70 @@ const support = await getEmbeddedPostgresTestSupport();
       if (scenario !== "pending_intent") expect(await readFile(path.join(checkout, "private.txt"), "utf8")).toBe("Private peer bytes");
     },
   );
+
+  it.each(["standard", "retained_low_trust", "current_low_trust"] as const)("recovers an exact legacy run-ID binding with %s trust", async trust => {
+    const f = await fixture();
+    const execution = buildNativeExecutionInput({
+      companyId: f.companyId, runId: f.runId, agentId: f.agentId,
+      issue: { id: f.issueId, identifier: "LEG-1", title: "Legacy recovery", description: null, workMode: "standard" },
+      taskPrompt: "Continue", normalizedSessionId: randomUUID(), provider: "codex",
+      workspace: { id: f.runId, cwd: f.admission.cwd, repoUrl: null, repoRef: null, branchName: null },
+      completionContract: { id: randomUUID(), sha256: `sha256:${"a".repeat(64)}`, schemaVersion: "paperclip.run-result.v1", contract: { revision: "1", objective: "Recover", criteria: [{ id: "objective", requirement: "Keep the admitted folder" }] } },
+      runtimeContext: nativeRuntimeContextFixture(),
+    });
+    await db.update(heartbeatRuns).set({ runtimeMode: "native", runnerProfileJson: { nativeExecutionInput: execution },
+      contextSnapshot: { issueId: f.issueId, ...(trust === "retained_low_trust" ? { executionPolicy: f.policy } : {}) } }).where(eq(heartbeatRuns.id, f.runId));
+    if (trust === "current_low_trust") await db.update(agents).set({ permissions: f.policy }).where(eq(agents.id, f.agentId));
+    await expect(f.service.reserveForRecovery({ ...f.admission, workspaceId: f.runId })).resolves.toBeUndefined();
+    const reservations = await db.select().from(executionWorkspaceRepositoryRoots).where(eq(executionWorkspaceRepositoryRoots.companyId, f.companyId));
+    expect(reservations).toHaveLength(trust === "standard" ? 0 : 1);
+    if (trust !== "standard") expect(reservations[0].mode).toBe("anonymous_only");
+    await expect(f.service.reserveForRecovery({ ...f.admission, workspaceId: randomUUID() })).rejects.toThrow(/recovery identity/);
+    execution.binding.agentId = randomUUID();
+    await db.update(heartbeatRuns).set({ runnerProfileJson: { nativeExecutionInput: execution } }).where(eq(heartbeatRuns.id, f.runId));
+    await expect(f.service.reserveForRecovery({ ...f.admission, workspaceId: f.runId })).rejects.toThrow(/recovery identity/);
+    expect(acquisition.materialize).not.toHaveBeenCalled();
+  });
+
+  it.each(["ENOTDIR", "EACCES"] as const)("ignores unrelated unavailable legacy managed paths (%s) while preserving anonymous roots", async code => {
+    const f = await fixture();
+    await f.request({ kind: "catalog", id: "private-repo" });
+    await db.delete(executionWorkspaceRepositoryRoots).where(eq(executionWorkspaceRepositoryRoots.companyId, f.companyId));
+    const peerRoot = path.join(root, `${f.issueId}-anonymous`);
+    await mkdir(peerRoot);
+    const peer = await lowTrustPeer(f, peerRoot);
+    const unavailableParent = path.join(root, `${f.issueId}-unavailable`);
+    await writeFile(unavailableParent, "Archived directory replaced by a file");
+    const unavailableCwd = path.join(unavailableParent, "checkout");
+    await db.update(executionWorkspaces).set({ cwd: unavailableCwd, status: "archived" }).where(eq(executionWorkspaces.id, f.workspace.id));
+    if (code === "EACCES") {
+      const actual = fs.realpath.bind(fs);
+      vi.spyOn(fs, "realpath").mockImplementation(async pathname => {
+        if (String(pathname).startsWith(unavailableParent)) throw Object.assign(new Error("fixture access denied"), { code: "EACCES" });
+        return actual(pathname);
+      });
+    }
+    await expect(f.service.prepareForAdmission(peer.admission)).resolves.toEqual([]);
+    // Once fenced, unrelated historical paths need no further filesystem reads.
+    vi.restoreAllMocks();
+    const actual = fs.realpath.bind(fs);
+    vi.spyOn(fs, "realpath").mockImplementation(async pathname => {
+      if (String(pathname) === unavailableCwd) throw new Error("Historical path must not be revisited");
+      return actual(pathname);
+    });
+    await expect(executionWorkspaceRepositoryService(db).prepareForAdmission(peer.admission)).resolves.toEqual([]);
+  });
+
+  it("still rejects a legacy pending managed receipt through a canonical path alias", async () => {
+    const f = await fixture();
+    await f.request({ kind: "catalog", id: "private-repo" });
+    await db.delete(executionWorkspaceRepositoryRoots).where(eq(executionWorkspaceRepositoryRoots.companyId, f.companyId));
+    const alias = path.join(root, `${f.issueId}-legacy-alias`);
+    await symlink(f.admission.cwd, alias);
+    await db.update(executionWorkspaces).set({ cwd: alias }).where(eq(executionWorkspaces.id, f.workspace.id));
+    const peer = await lowTrustPeer(f);
+    await expect(f.service.prepareForAdmission(peer.admission)).rejects.toThrow(/anonymous public URLs only/);
+  });
 
   it("reserves a legacy low-trust recovery folder after its task binding moves", async () => {
     const f = await fixture();

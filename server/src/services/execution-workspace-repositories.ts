@@ -9,6 +9,7 @@ import { activityLog, agents, heartbeatRuns, projects, executionWorkspaceReposit
 import { prepareWorkspaceRepositorySchema, type PrepareWorkspaceRepository, type ProjectRepository } from "@paperclipai/shared";
 import { withDirectoryPublicationLock } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { conflict, forbidden, notFound } from "../errors.js";
+import { parseNativeExecutionInput } from "../vendor/paperclip-runner/index.js";
 import { assertTaskWorkspaceAccess } from "./task-workspace-source-access.js";
 import { authorizationService, canActorReadExecutionWorkspace, issueReadSqlCondition, type AuthorizationActor } from "./authorization.js";
 import { resolveCoreTrustPreset } from "./trust-preset-resolver.js";
@@ -31,6 +32,34 @@ async function canonicalRepositoryRoot(cwd: string): Promise<string> {
     const parent = path.dirname(absolute);
     if (parent === absolute) throw error;
     return path.join(await canonicalRepositoryRoot(parent), path.basename(absolute));
+  }
+}
+
+/** An unavailable legacy path must not block unrelated roots. Preserve the
+ * unresolved suffix and reject roots inside an inaccessible prefix, since a
+ * hidden symlink may still point at the candidate's admitted directory. */
+async function legacyRepositoryRootMayMatch(cwd: string, candidate: string): Promise<boolean> {
+  const absolute = path.resolve(cwd);
+  if (absolute === candidate) return true;
+  let probe = absolute;
+  let suffix = "";
+  let inaccessiblePrefix: string | null = null;
+  for (;;) {
+    try {
+      const canonical = await fs.realpath(probe);
+      if (path.join(canonical, suffix) === candidate) return true;
+      if (!inaccessiblePrefix) return false;
+      const unresolved = path.join(canonical, path.relative(probe, inaccessiblePrefix));
+      return candidate === unresolved || candidate.startsWith(`${unresolved}${path.sep}`);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (!["ENOENT", "ENOTDIR", "EACCES", "EPERM"].includes(code ?? "")) throw error;
+      if (code === "EACCES" || code === "EPERM") inaccessiblePrefix = probe;
+      const parent = path.dirname(probe);
+      if (parent === probe) return true;
+      suffix = path.join(path.basename(probe), suffix);
+      probe = parent;
+    }
   }
 }
 
@@ -71,7 +100,7 @@ export function executionWorkspaceRepositoryService(db: Db) {
     return (await toolAccessService(db).listProjectRepositories(companyId, userId, localTrusted)).repositories;
   }
   async function requiresAnonymousAcquisition(reader: Db | DbTransaction, input: {
-    issue: typeof issues.$inferSelect; workspace: typeof executionWorkspaces.$inferSelect;
+    issue: typeof issues.$inferSelect; workspace: typeof executionWorkspaces.$inferSelect | null;
     agentId?: string | null; runId?: string | null;
   }) {
     const { issue, workspace } = input;
@@ -79,7 +108,7 @@ export function executionWorkspaceRepositoryService(db: Db) {
     const [agent] = agentId ? await reader.select().from(agents).where(and(eq(agents.id, agentId), eq(agents.companyId, issue.companyId))) : [];
     if (agentId && !agent) throw forbidden("Task repository agent is unavailable");
     const [project] = issue.projectId ? await reader.select().from(projects).where(and(eq(projects.id, issue.projectId), eq(projects.companyId, issue.companyId))) : [];
-    const [workspaceSourceProject] = workspace.projectId ? await reader.select().from(projects).where(and(eq(projects.id, workspace.projectId), eq(projects.companyId, issue.companyId))) : [];
+    const [workspaceSourceProject] = workspace?.projectId ? await reader.select().from(projects).where(and(eq(projects.id, workspace.projectId), eq(projects.companyId, issue.companyId))) : [];
     const runId = input.runId ?? issue.executionRunId;
     const [run] = runId ? await reader.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, issue.companyId))) : [];
     if (runId && (!run || (input.runId && run.agentId !== agentId) || (run.nativeIssueId ?? run.contextSnapshot?.issueId ?? run.contextSnapshot?.taskId ?? run.issueId) !== issue.id)) {
@@ -101,6 +130,7 @@ export function executionWorkspaceRepositoryService(db: Db) {
     const [existing] = await tx.select().from(executionWorkspaceRepositoryRoots).where(and(
       eq(executionWorkspaceRepositoryRoots.companyId, companyId), eq(executionWorkspaceRepositoryRoots.rootKey, rootKey)));
     if (existing && (existing.canonicalCwd !== canonicalCwd || existing.mode !== mode)) throw forbidden(lowTrustRepositoryMessage);
+    if (existing) return canonicalCwd;
     if (mode === "anonymous_only") {
       // Legacy receipts predate root reservations. Even pending/staging work
       // can publish after admission, so no managed intent in this root is safe.
@@ -109,7 +139,7 @@ export function executionWorkspaceRepositoryService(db: Db) {
         .where(and(eq(executionWorkspaceRepositories.companyId, companyId), eq(executionWorkspaces.companyId, companyId),
           isNotNull(executionWorkspaceRepositories.catalogRepositoryId)));
       for (const peer of managed) {
-        if (peer.cwd && await canonicalRepositoryRoot(peer.cwd) === canonicalCwd) throw forbidden(lowTrustRepositoryMessage);
+        if (peer.cwd && await legacyRepositoryRootMayMatch(peer.cwd, canonicalCwd)) throw forbidden(lowTrustRepositoryMessage);
       }
     }
     if (!existing) await tx.insert(executionWorkspaceRepositoryRoots).values({ companyId, canonicalCwd, rootKey, mode });
@@ -189,8 +219,22 @@ export function executionWorkspaceRepositoryService(db: Db) {
   async function reserveForRecovery(input: { companyId: string; issueId: string; workspaceId: string; cwd: string; agentId: string; runId: string }) {
     const [issue] = await db.select().from(issues).where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)));
     const [workspace] = await db.select().from(executionWorkspaces).where(and(eq(executionWorkspaces.id, input.workspaceId), eq(executionWorkspaces.companyId, input.companyId)));
-    if (!issue || !workspace) throw forbidden("Task repository recovery identity is unavailable");
-    const anonymousOnly = await requiresAnonymousAcquisition(db, { issue, workspace, agentId: input.agentId, runId: input.runId });
+    if (!issue) throw forbidden("Task repository recovery identity is unavailable");
+    if (!workspace) {
+      // Older projectless native admissions used the run ID as a transient
+      // workspace binding. Only the persisted exact native binding grants this exception.
+      const [run] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId)));
+      let execution;
+      try { execution = parseNativeExecutionInput(run?.runnerProfileJson?.nativeExecutionInput); } catch { /* Fail closed below. */ }
+      const binding = execution?.binding;
+      if (input.workspaceId !== input.runId || run?.runtimeMode !== "native" || !binding
+        || binding.companyId !== input.companyId || binding.runId !== input.runId
+        || binding.agentId !== input.agentId || binding.issueId !== input.issueId
+        || binding.executionWorkspaceId !== input.runId) {
+        throw forbidden("Task repository recovery identity is unavailable");
+      }
+    }
+    const anonymousOnly = await requiresAnonymousAcquisition(db, { issue, workspace: workspace ?? null, agentId: input.agentId, runId: input.runId });
     if (anonymousOnly) await reserveAdmissionRoot(input.companyId, input.cwd, "anonymous_only");
     else if ((await list(input.companyId, input.workspaceId)).some(row => row.catalogRepositoryId)) {
       await reserveAdmissionRoot(input.companyId, input.cwd, "managed");
@@ -229,7 +273,7 @@ export function executionWorkspaceRepositoryService(db: Db) {
     const [issue] = await db.select().from(issues).where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)));
     const [workspace] = await db.select().from(executionWorkspaces).where(and(eq(executionWorkspaces.id, input.workspaceId), eq(executionWorkspaces.companyId, input.companyId)));
     if (!issue || !workspace || issue.executionWorkspaceId !== workspace.id) throw forbidden("Task repository workspace binding is unavailable");
-    const anonymousOnly = await requiresAnonymousAcquisition(db, { issue, workspace, agentId: input.agentId, runId: input.runId });
+    const anonymousOnly = await requiresAnonymousAcquisition(db, { issue, workspace: workspace ?? null, agentId: input.agentId, runId: input.runId });
     // Ordinary admission without acquisitions is owned by heartbeat, not this mutation service.
     if (!rows.length) {
       if (anonymousOnly) await reserveAdmissionRoot(input.companyId, input.cwd, "anonymous_only");

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { captureDirectorySnapshot, directorySnapshotSha256, serializeDirectorySnapshot } from "@paperclipai/adapter-utils/workspace-restore-merge";
+import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { agents, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, environmentLeases, heartbeatRuns, issues, projects, projectWorkspaces, type Db } from "@paperclipai/db";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -13,7 +14,7 @@ import { environmentService } from "../environments.js";
 import { executionWorkspaceService } from "../execution-workspaces.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { workspaceOperationService } from "../workspace-operations.js";
-import { nativeWorkspaceSyncInternals } from "../native-runtime/native-workspace-sync.js";
+import { nativeWorkspaceSyncInternals, prepareNativeWorkspaceSync } from "../native-runtime/native-workspace-sync.js";
 import { createHeartbeatWorkspaceResolver, resolveExecutionWorkspaceReuseRequestForIssue } from "./workspaces.js";
 import { prepareHeartbeatWorkspace, type HeartbeatWorkspacePreparationInput } from "./workspace-preparation.js";
 
@@ -160,53 +161,90 @@ describe.skipIf(!support.supported)("heartbeat workspace preparation boundary", 
     const anchor = vi.spyOn(input.services, "resolveReusedGitWorkspaceAnchor");
     const prepareRepositories = vi.spyOn(input.services.executionWorkspacesSvc, "prepareTaskRepositoriesForAdmission");
     const reserveRoot = vi.spyOn(input.services.executionWorkspacesSvc, "reserveTaskRepositoryRootForRecovery");
-    const acquire = input.services.envOrchestrator.acquireForRun;
-    vi.spyOn(input.services.envOrchestrator, "acquireForRun").mockImplementation(async args => {
-      expect(reserveRoot).toHaveBeenCalledWith({ companyId: issue.companyId, issueId: issue.id,
-        workspaceId: first.persistedExecutionWorkspace!.id, cwd: first.executionWorkspace.cwd,
-        agentId: input.agent.id, runId: input.run.id });
-      return acquire(args);
-    });
     const next = await prepareHeartbeatWorkspace(db, input);
+    expect(reserveRoot).toHaveBeenCalledWith({ companyId: issue.companyId, issueId: issue.id,
+      workspaceId: first.persistedExecutionWorkspace!.id, cwd: first.executionWorkspace.cwd,
+      agentId: input.agent.id, runId: input.run.id });
     expect(prepareRepositories).not.toHaveBeenCalled();
     expect(next.persistedExecutionWorkspace!.id).toBe(first.persistedExecutionWorkspace!.id);
     expect(anchor).toHaveBeenCalledWith(expect.objectContaining({ immutableNativeBinding: true, explicitProjectWorkspaceId: first.persistedExecutionWorkspace!.projectWorkspaceId }));
     expect(await readIssue(issue.id)).toMatchObject({ executionWorkspaceId: null, projectWorkspaceId: null });
   });
 
-  it.each([false, true])("requires the immutable host descriptor for remote recovery (present=%s)", async present => {
+  it.each([
+    { transport: "local", descriptor: "absent" },
+    { transport: "ssh", descriptor: "absent" },
+    { transport: "daytona", descriptor: "valid" },
+    { transport: "daytona", descriptor: "absent" },
+    { transport: "daytona", descriptor: "corrupt" },
+  ] as const)("reserves the admitted host root for $transport recovery with $descriptor descriptor", async ({ transport, descriptor }) => {
     const { input, issue } = await fixture(true);
     const first = await prepareHeartbeatWorkspace(db, input);
     await reuse(input, first.persistedExecutionWorkspace!);
     await db.update(issues).set({ executionWorkspaceId: null, projectWorkspaceId: null }).where(eq(issues.id, issue.id));
     input.task.issueRef = { ...input.task.issueRef!, executionWorkspaceId: null, projectWorkspaceId: null };
     input.reuse.nativeRecoveryExecutionWorkspaceId = first.persistedExecutionWorkspace!.id;
-    input.environment.selectedEnvironmentForConfig = { ...input.environment.localEnvironment, driver: "ssh" };
     const admittedRoot = join(home, `admitted-${input.run.id}`);
     await mkdir(admittedRoot);
-    if (present) {
+    const remoteCwd = "/remote/admitted-task";
+    input.reuse.persistedNativeExecutionInput = {
+      schema: "paperclip.native-execution-input.v1",
+      binding: { companyId: issue.companyId, runId: input.run.id, issueId: issue.id,
+        agentId: input.agent.id, executionWorkspaceId: first.persistedExecutionWorkspace!.id },
+      task: { identifier: "WSP-1", title: issue.title, description: null, prompt: "Continue admitted work", workMode: "standard" },
+      workspace: { cwd: transport === "local" ? admittedRoot : remoteCwd, repoUrl: null, repoRef: null, branchName: null },
+      session: { normalizedSessionId: null, driverKind: "codex_app_server", protocolVersion: 1,
+        lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null } },
+      provider: { kind: "codex", model: null },
+      completionContract: { id: "contract", sha256: "abc123", schemaVersion: "paperclip.completion-contract.v1",
+        contract: { revision: "1", objective: "Continue admitted work", criteria: [{ id: "objective", requirement: "Finish" }] } },
+      interactionResponses: [], credentialBindings: [],
+    };
+    const target: AdapterExecutionTarget = transport === "local" ? { kind: "local" }
+      : transport === "ssh" ? { kind: "remote", transport: "ssh", remoteCwd,
+        spec: { host: "fixture.invalid", port: 22, username: "fixture", remoteWorkspacePath: remoteCwd,
+          privateKey: null, knownHosts: null, strictHostKeyChecking: true, remoteCwd } }
+      : { kind: "remote", transport: "sandbox", providerKey: "daytona", remoteCwd };
+    // Double the external transport boundary, while retaining real workspace,
+    // database, lease and descriptor handling. Driver hints alone cannot decide.
+    const realize = input.services.envOrchestrator.realizeForRun;
+    vi.spyOn(input.services.envOrchestrator, "realizeForRun").mockImplementation(async args => ({
+      ...await realize(args), executionTarget: target,
+    }));
+    if (descriptor !== "absent") {
       const baseline = await captureDirectorySnapshot(admittedRoot);
       const reference = await nativeWorkspaceSyncInternals.writeDescriptor({
         schema: "paperclip.native-workspace-sync/v1", state: "prepared",
         binding: { companyId: issue.companyId, runId: input.run.id, workspaceId: first.persistedExecutionWorkspace!.id,
-          leaseId: "admitted-lease", providerLeaseId: "admitted-provider", localCwd: admittedRoot, remoteCwd: "/workspace" },
+          leaseId: "admitted-lease", providerLeaseId: "admitted-provider", localCwd: admittedRoot, remoteCwd },
         baseline: serializeDirectorySnapshot(baseline), baselineSha256: directorySnapshotSha256(baseline),
         gitSnapshot: null, seed: null, createdAt: new Date().toISOString(), finalizedAt: null, finalHostSha256: null, resourceDisposition: null,
       });
       input.run.runnerProfileJson = { nativeWorkspaceSync: reference };
+      if (descriptor === "corrupt") {
+        await writeFile(nativeWorkspaceSyncInternals.descriptorPath(input.run.id, reference.descriptorSha256), "{}");
+      }
     }
     const reserve = vi.spyOn(input.services.executionWorkspacesSvc, "reserveTaskRepositoryRootForRecovery");
     const prepare = vi.spyOn(input.services.executionWorkspacesSvc, "prepareTaskRepositoriesForAdmission");
-    const acquire = vi.spyOn(input.services.envOrchestrator, "acquireForRun");
-    if (present) {
-      await prepareHeartbeatWorkspace(db, input);
-      expect(reserve).toHaveBeenCalledWith({ companyId: issue.companyId, issueId: issue.id,
+    if (transport !== "daytona" || descriptor === "valid") {
+      const result = await prepareHeartbeatWorkspace(db, input);
+      expect(result.executionTarget).toEqual(target);
+      if (transport === "ssh") expect(reserve).not.toHaveBeenCalled();
+      else expect(reserve).toHaveBeenCalledWith({ companyId: issue.companyId, issueId: issue.id,
         workspaceId: first.persistedExecutionWorkspace!.id, cwd: admittedRoot, agentId: input.agent.id, runId: input.run.id });
+      if (transport !== "daytona") {
+        await expect(prepareNativeWorkspaceSync({ db, runId: input.run.id, companyId: issue.companyId,
+          workspaceId: first.persistedExecutionWorkspace!.id, workspaceLocalDir: first.executionWorkspace.cwd,
+          target, lease: result.activeEnvironmentLease.lease })).resolves.toBeNull();
+      }
       expect(admittedRoot).not.toBe(first.executionWorkspace.cwd);
     } else {
-      await expect(prepareHeartbeatWorkspace(db, input)).rejects.toThrow("native_workspace_sync_descriptor_binding_missing");
+      await expect(prepareHeartbeatWorkspace(db, input)).rejects.toThrow(descriptor === "absent"
+        ? "native_workspace_sync_descriptor_binding_missing" : "native_workspace_sync_descriptor_digest_mismatch");
       expect(reserve).not.toHaveBeenCalled();
-      expect(acquire).not.toHaveBeenCalled();
+      // The outer run owner retains its normal terminalization/lease cleanup path.
+      expect(await leases(input.run.id)).toMatchObject([{ status: "active" }]);
     }
     expect(prepare).not.toHaveBeenCalled();
     expect((await readIssue(issue.id)).executionWorkspaceId).toBeNull();
