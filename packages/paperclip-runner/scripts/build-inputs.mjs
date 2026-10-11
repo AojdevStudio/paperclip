@@ -214,7 +214,7 @@ export function assessRunnerBuild({
     return {
       current: false,
       code: "inputs_changed",
-      detail: `inputs changed since the recorded build (${inputs.fileCount} files checked)`,
+      detail: `inputs changed since the recorded build; ${inputs.fileCount} files checked`,
       stampPath,
       inputs,
     };
@@ -222,7 +222,7 @@ export function assessRunnerBuild({
   return {
     current: true,
     code: "inputs_unchanged",
-    detail: `inputs unchanged since the build recorded at ${stamp.recordedAt} (${inputs.fileCount} files checked)`,
+    detail: `inputs unchanged since the build recorded at ${stamp.recordedAt}; ${inputs.fileCount} files checked`,
     stampPath,
     inputs,
     stamp,
