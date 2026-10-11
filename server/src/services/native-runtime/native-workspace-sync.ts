@@ -1091,6 +1091,29 @@ export async function prepareNativeWorkspaceSync(input: {
   }
 }
 
+/** Read the admitted host root without reacquiring or transferring workspace files. */
+export async function readNativeWorkspaceSyncLocalCwd(input: {
+  companyId: string;
+  runId: string;
+  workspaceId: string;
+  reference: NativeWorkspaceSyncReference;
+}): Promise<string> {
+  const existing = await readDescriptor(input);
+  try {
+    if (existing.descriptor.binding.companyId !== input.companyId ||
+        existing.descriptor.binding.workspaceId !== input.workspaceId) {
+      throw new Error("native_workspace_sync_descriptor_binding_mismatch");
+    }
+    return existing.descriptor.binding.localCwd;
+  } finally {
+    await disposeDirectorySnapshot(existing.baseline);
+    await disposeGitWorkspaceSnapshot(existing.descriptor.gitSnapshot);
+    for (const repository of existing.descriptor.repositories ?? []) {
+      await disposeGitWorkspaceSnapshot(repository.snapshot);
+    }
+  }
+}
+
 export async function resumeNativeWorkspaceSync(input: {
   db: Db;
   runId: string;

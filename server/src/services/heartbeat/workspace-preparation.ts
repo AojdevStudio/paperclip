@@ -24,7 +24,7 @@ import { createHostDuplexObservabilityRecorder } from "../duplex-observability-r
 import { incrementToolRuntimeMetricCounter } from "../tool-runtime-metrics.js";
 import { logger } from "../../middleware/logger.js";
 import { createGitRemoteAuthProvider } from "../git-credentials.js";
-import { readNativeWorkspaceSyncReference } from "../native-runtime/index.js";
+import { readNativeWorkspaceSyncReference, readNativeWorkspaceSyncLocalCwd } from "../native-runtime/index.js";
 import { parseObject } from "../../adapters/utils.js";
 import { materializeNativeChatTaskRoot } from "../native-runtime/native-chat-workspace.js";
 import { materializeIsolatedTaskDirectory } from "../isolated-task-directory.js";
@@ -126,7 +126,7 @@ export interface HeartbeatWorkspacePreparationInput {
   };
   services: {
     envOrchestrator: Pick<ReturnType<typeof environmentRunOrchestrator>, "resolveEnvironment" | "acquireForRun" | "realizeForRun">;
-    executionWorkspacesSvc: Pick<ReturnType<typeof executionWorkspaceService>, "create" | "update" | "bindTaskWorkspace" | "prepareTaskRepositoriesForAdmission">;
+    executionWorkspacesSvc: Pick<ReturnType<typeof executionWorkspaceService>, "create" | "update" | "bindTaskWorkspace" | "prepareTaskRepositoriesForAdmission" | "reserveTaskRepositoryRootForRecovery">;
     workspaceOperationsSvc: Pick<ReturnType<typeof workspaceOperationService>, "createRecorder">;
     resolveWorkspaceForRun: WorkspaceResolver["resolveWorkspaceForRun"];
     resolveReusedGitWorkspaceAnchor: WorkspaceResolver["resolveReusedGitWorkspaceAnchor"];
@@ -885,11 +885,28 @@ export async function prepareHeartbeatWorkspace(db: Db, input: HeartbeatWorkspac
       repoRef: readNonEmptyString(source.repoRef),
     }));
   }
-  if (persistedExecutionWorkspace && issueId && !persistedNativeExecutionInput) {
+  if (persistedExecutionWorkspace && issueId && !persistedNativeExecutionInput && !nativeRecoveryExecutionWorkspaceId) {
     const taskRepositories = await executionWorkspacesSvc.prepareTaskRepositoriesForAdmission({ companyId: agent.companyId,
       issueId, workspaceId: persistedExecutionWorkspace.id, cwd: executionWorkspace.cwd,
       agentId: agent.id, runId: run.id, responsibleUserId });
     projectRepositoryPaths.push(...taskRepositories.map(repository => repository.relativePath));
+  }
+  if (!isDotRun && issueId && (persistedNativeExecutionInput || nativeRecoveryExecutionWorkspaceId)) {
+    const workspaceId = persistedNativeExecutionInput?.binding.executionWorkspaceId ?? nativeRecoveryExecutionWorkspaceId!;
+    const reference = readNativeWorkspaceSyncReference(parseObject(run.runnerProfileJson).nativeWorkspaceSync);
+    if (!reference && selectedEnvironmentForConfig?.driver !== "local") {
+      throw new Error("native_workspace_sync_descriptor_binding_missing");
+    }
+    // Recovery keeps admitted files and trust even when the task now selects
+    // another workspace. Reserve only; never acquire newly requested repositories.
+    const cwd = reference
+      ? await readNativeWorkspaceSyncLocalCwd({ companyId: agent.companyId, runId: run.id, workspaceId, reference })
+      : persistedNativeExecutionInput && persistedNativeExecutionInput.schema !== "paperclip.native-execution-input.v6"
+        && selectedEnvironmentForConfig?.driver === "local"
+        ? persistedNativeExecutionInput.workspace.cwd
+        : executionWorkspace.cwd;
+    await executionWorkspacesSvc.reserveTaskRepositoryRootForRecovery({ companyId: agent.companyId,
+      issueId, workspaceId, cwd, agentId: agent.id, runId: run.id });
   }
   if (persistedExecutionWorkspace) {
     context.executionWorkspaceId = persistedExecutionWorkspace.id;
