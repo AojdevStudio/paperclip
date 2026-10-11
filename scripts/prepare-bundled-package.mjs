@@ -51,13 +51,14 @@ export function createBundledInstallManifest(publishManifest, bundledDependencie
 }
 
 // npm consumers cannot inherit the workspace's pnpm overrides or patches.
-// Materialize the already-qualified Codex bridge closure in the tarball,
+// Materialize the already-qualified provider bridge closures in the tarball,
 // with overrides confined to the temporary, scripts-disabled producer graph.
 export function configureBundledProviderOverrides(installManifest, bundledDependencies, rootPackage, profileData) {
   const result = structuredClone(installManifest);
   const selected = [];
   for (const [agent, serverPackage, runtimePackage] of [
     ["codex", "@agentclientprotocol/codex-acp", "@openai/codex"],
+    ["claude", "@agentclientprotocol/claude-agent-acp", "@anthropic-ai/claude-agent-sdk"],
   ]) {
     if (!bundledDependencies.includes(serverPackage)) continue;
     const profile = profileData?.profiles?.[agent];
@@ -75,9 +76,13 @@ export function configureBundledProviderOverrides(installManifest, bundledDepend
     if (result.overrides?.[npmSelector] !== undefined) {
       throw new Error(`Bundled ${agent} runtime has a conflicting producer override`);
     }
-    const overrides = { [runtimePackage]: profile.agentRuntimeVersion };
+    const overrides = { [runtimePackage]: profile.agentRuntimeVersion,
+      ...(agent === "claude" ? { "@agentclientprotocol/sdk": "1.4.0", zod: "4.4.3" } : {}),
+    };
     result.overrides = { ...result.overrides, [npmSelector]: overrides };
-    selected.push({ agent, ...profile });
+    // Codex delegates its platform aliases below. Claude retains the SDK
+    // platform dependencies in its ordinary bundled provider closure.
+    if (agent === "codex") selected.push({ agent, ...profile });
   }
   return { installManifest: result, profiles: selected };
 }

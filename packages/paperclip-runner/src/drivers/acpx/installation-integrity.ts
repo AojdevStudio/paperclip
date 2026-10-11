@@ -645,7 +645,22 @@ export async function verifyQualifiedAcpxInstallation(
   if (builtin && (profile.agentServerPackage !== "builtin:grok-acp" || profile.agentServerVersion !== "1" || profile.agentRuntimePackage !== "native:grok" || profile.agentRuntimeVersion !== "1.0.13")) {
     throw new Error("Grok builtin profile identity mismatch");
   }
-  const serverPackageJsonPath = builtin ? null : await realpath(resolvePackageJson(profile.agentServerPackage));
+  let serverPackageJsonPath: string | null = null;
+  if (!builtin) {
+    try {
+      serverPackageJsonPath = await realpath(resolvePackageJson(profile.agentServerPackage));
+    } catch (error) {
+      if ((profile.agent === "claude" || profile.agent === "codex") &&
+          error instanceof Error && "code" in error &&
+          (error.code === "MODULE_NOT_FOUND" || error.code === "ERR_MODULE_NOT_FOUND")) {
+        throw Object.assign(new Error(
+          `The ACPX ${profile.agent} runtime is incomplete: required package ${profile.agentServerPackage} is missing. ` +
+          "Reinstall or rebuild Paperclip with its bundled provider dependencies, restart the server, then test the agent's runtime before retrying.",
+        ), { code: "ACPX_RUNTIME_PACKAGE_MISSING" });
+      }
+      throw error;
+    }
+  }
   const serverPackage: AcpxPackageMetadata = builtin
     ? { version: "1", bin: "launcher.cjs", type: "commonjs" }
     : await readPackageJson(serverPackageJsonPath!, profile.agentServerPackage);

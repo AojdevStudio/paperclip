@@ -176,6 +176,19 @@ test("published packages preserve the patched ACPX runtime", () => {
   assert.equal(cliEsbuildConfig.external.includes("acpx"), false);
 });
 
+test("published Claude bridge pins its qualified SDK and provider dependency closure", () => {
+  const published = materializePublishManifest(serverPackage);
+  const { installManifest } = configureBundledProviderOverrides(
+    createBundledInstallManifest(published, serverPackage.bundleDependencies),
+    serverPackage.bundleDependencies, rootPackage, profileData,
+  );
+  assert.deepEqual(installManifest.overrides["@agentclientprotocol/claude-agent-acp@0.73.0"], {
+    "@anthropic-ai/claude-agent-sdk": "0.3.286",
+    "@agentclientprotocol/sdk": "1.4.0",
+    zod: "4.4.3",
+  });
+});
+
 test("published Codex bridge uses its qualified producer closure without consumer overrides", () => {
   const published = materializePublishManifest(serverPackage);
   const { installManifest, profiles } = configureBundledProviderOverrides(

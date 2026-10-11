@@ -54,6 +54,21 @@ afterEach(async () => {
 });
 
 describe("ACPX installation integrity", () => {
+  it("explains a missing Claude ACP installation without leaking the resolver stack", async () => {
+    const missingPackage = Object.assign(new Error(
+      "Cannot find module '@agentclientprotocol/claude-agent-acp/package.json'\nRequire stack: /srv/private/server.js",
+    ), { code: "MODULE_NOT_FOUND" });
+    const error = await verifyQualifiedAcpxInstallation(
+      resolveQualifiedAcpxProfile("claude", "claude-opus-5-5"),
+      () => { throw missingPackage; },
+    ).catch(error => error);
+    expect(error).toMatchObject({ code: "ACPX_RUNTIME_PACKAGE_MISSING" });
+    expect(error.message).toContain("@agentclientprotocol/claude-agent-acp");
+    expect(error.message).toContain("Reinstall or rebuild");
+    expect(error.message).not.toContain("/srv/private");
+    expect(error.message).not.toContain("Require stack");
+  });
+
   it.each([false, true])("admits only the declared qualified Codex platform in its npm-hoisted slot (published platform declaration: %s)", async (publishedDeclaration) => {
     const parent = await realpath(await mkdtemp(join(tmpdir(), "paperclip-codex-npm-hoist-")));
     temporaryDirectories.push(parent);
