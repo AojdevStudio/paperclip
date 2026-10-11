@@ -28,17 +28,17 @@ ALTER TABLE "issues" ADD COLUMN IF NOT EXISTS "workspace_binding_revision" integ
 ALTER TABLE "issues" ADD COLUMN IF NOT EXISTS "workspace_selection" jsonb;--> statement-breakpoint
 ALTER TABLE "issues" ADD COLUMN IF NOT EXISTS "workspace_pending_selection" jsonb;--> statement-breakpoint
 DO $migration$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'execution_workspace_repositories'::regclass AND conname = 'execution_workspace_repositories_company_id_companies_id_fk') THEN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'execution_workspace_repositories'::regclass AND conname = 'execution_workspace_repositories_company_id_companies_id_fk'::name) THEN
     ALTER TABLE "execution_workspace_repositories" ADD CONSTRAINT "execution_workspace_repositories_company_id_companies_id_fk" FOREIGN KEY ("company_id") REFERENCES "public"."companies"("id") ON DELETE cascade ON UPDATE no action;
   END IF;
 END $migration$;--> statement-breakpoint
 DO $migration$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'execution_workspace_repositories'::regclass AND conname = 'execution_workspace_repositories_execution_workspace_id_execution_workspaces_id_fk') THEN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'execution_workspace_repositories'::regclass AND conname = 'execution_workspace_repositories_execution_workspace_id_execution_workspaces_id_fk'::name) THEN
     ALTER TABLE "execution_workspace_repositories" ADD CONSTRAINT "execution_workspace_repositories_execution_workspace_id_execution_workspaces_id_fk" FOREIGN KEY ("execution_workspace_id") REFERENCES "public"."execution_workspaces"("id") ON DELETE cascade ON UPDATE no action;
   END IF;
 END $migration$;--> statement-breakpoint
 DO $migration$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'execution_workspace_repositories'::regclass AND conname = 'execution_workspace_repositories_requested_by_issue_id_issues_id_fk') THEN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'execution_workspace_repositories'::regclass AND conname = 'execution_workspace_repositories_requested_by_issue_id_issues_id_fk'::name) THEN
     ALTER TABLE "execution_workspace_repositories" ADD CONSTRAINT "execution_workspace_repositories_requested_by_issue_id_issues_id_fk" FOREIGN KEY ("requested_by_issue_id") REFERENCES "public"."issues"("id") ON DELETE set null ON UPDATE no action;
   END IF;
 END $migration$;--> statement-breakpoint

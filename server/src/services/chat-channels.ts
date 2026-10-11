@@ -1,4 +1,6 @@
-import { notifyChatDeliveryWork, notifyChatPublicationWork, notifyChatEndpointWork } from "./chat-work-notifications.js";
+import { dueChatAction, nextChatActionAt, SLACK_COMMAND_POST_STALE_MS, SLACK_COMMAND_EXPLICIT_RETRY_STALE_MS, SLACK_COMMAND_ADMISSION_STALE_MS, PROVIDER_EFFECT_STALE_MS } from "./chat-action-work.js";
+import type { ScheduledChatAction } from "./chat-work-notifications.js";
+import { notifyChatDeliveryWork, notifyChatPublicationWork, notifyChatEndpointWork, notifyChatActionWork, notifyChatVerificationWork } from "./chat-work-notifications.js";
 import { syncSpekoVoiceTools } from "./voice/speko-agent-tools.js";
 import { configureSpekoSessionTools } from "./voice/speko-tool-setup.js";
 import { voiceSessionService } from "./voice/voice-session-service.js";
@@ -13,6 +15,8 @@ import {
   stageReceiptReactionRemovals,
   type ReceiptReactionPayload,
 } from "./chat-receipt-reactions.js";
+import { fastResponseService, enqueueFastResponse, fastResponseSourceCurrent, fastResponseTurnQueued } from "./fast-responses.js";
+import { fastResponseRequests } from "@paperclipai/db";
 import { chatCredentialMutationLease, CREDENTIAL_MUTATION_LEASE_TTL_MS, type CredentialMutationLeaseGuard } from "./chat-credential-mutation-lease.js";
 import type { AgentAvatarRequest } from "./agent-avatars.js";
 import { slackChatRegistrationService, slackRegistrationProjection } from "./chat-slack-registration.js";
@@ -862,10 +866,6 @@ const REACTION_LINK_MAX_AGE_MS = 2 * 60_000;
 const DISCORD_ROOT_THREAD_CONFIRMATION_DELAY_MS = 5 * 60_000;
 const DELIVERY_LEASE_TTL_MS = 90_000;
 const DELIVERY_DRAIN_LIMIT = 100;
-const SLACK_COMMAND_POST_STALE_MS = 60_000;
-const SLACK_COMMAND_EXPLICIT_RETRY_STALE_MS = 5 * 60_000;
-const SLACK_COMMAND_ADMISSION_STALE_MS = 60_000;
-const PROVIDER_EFFECT_STALE_MS = 60_000;
 const SLACK_FILE_RECEIPT_MAX_AGE_MS = 24 * 60 * 60_000;
 const SLACK_FILE_RECEIPT_MAX_ATTEMPTS = 12;
 const SLACK_FILE_RECEIPT_STALE_MS = 60_000;
@@ -3472,27 +3472,30 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     // endpoint again after a rotation and accidentally blessing an obsolete
     // adapter with the new generation.
     const context = input.runtimeContext ?? runtimeContextForRecord(record);
-    const [inserted] = await db
-      .insert(chatActions)
-      .values({
-        companyId: input.endpoint.companyId,
-        endpointId: input.endpoint.id,
-        deliveryId: input.deliveryId,
-        kind: "receipt_reaction",
-        providerActionId: `receipt_reaction:${input.deliveryId}`,
-        payload: {
-          version: 1,
-          operation: "add",
-          threadId: input.thread.id,
-          messageId: input.message.id,
-          reaction: "eyes",
-          runtimeGeneration: context.generation,
-          credentialFingerprint: context.credentialFingerprint,
-        } satisfies ReceiptReactionPayload,
-        status: "received",
-      })
-      .onConflictDoNothing()
-      .returning({ id: chatActions.id });
+    const [inserted] = await db.transaction(async (tx) => {
+      await notifyChatActionWork(tx, "receipt_reaction");
+      return tx
+        .insert(chatActions)
+        .values({
+          companyId: input.endpoint.companyId,
+          endpointId: input.endpoint.id,
+          deliveryId: input.deliveryId,
+          kind: "receipt_reaction",
+          providerActionId: `receipt_reaction:${input.deliveryId}`,
+          payload: {
+            version: 1,
+            operation: "add",
+            threadId: input.thread.id,
+            messageId: input.message.id,
+            reaction: "eyes",
+            runtimeGeneration: context.generation,
+            credentialFingerprint: context.credentialFingerprint,
+          } satisfies ReceiptReactionPayload,
+          status: "received",
+        })
+        .onConflictDoNothing()
+        .returning({ id: chatActions.id });
+    });
     const actionId =
       inserted?.id ??
       (await db
@@ -3621,17 +3624,20 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     if (!action || ["processed", "cancelled"].includes(action.status)) return;
     const payload = receiptReactionPayload(action.payload);
     if (!payload) {
-      await db
-        .update(chatActions)
-        .set({
-          status: "failed",
-          result: {
-            code: "receipt_reaction_payload_invalid",
-            retryable: false,
-          },
-          updatedAt: new Date(),
-        })
-        .where(eq(chatActions.id, action.id));
+      await db.transaction(async (tx) => {
+        await notifyChatActionWork(tx, "receipt_reaction");
+        return tx
+          .update(chatActions)
+          .set({
+            status: "failed",
+            result: {
+              code: "receipt_reaction_payload_invalid",
+              retryable: false,
+            },
+            updatedAt: new Date(),
+          })
+          .where(eq(chatActions.id, action.id));
+      });
       return;
     }
     if (payload.operation === "add" && action.deliveryId) {
@@ -3651,6 +3657,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       if (terminalRemoval) {
         await db.transaction(async (tx) => {
           await credentialLease.assertOwned(tx);
+          await notifyChatActionWork(tx, "receipt_reaction");
           await tx
             .update(chatActions)
             .set({
@@ -3680,24 +3687,27 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       // Adding or removing the same reaction is idempotent. A worker
       // interruption can be retried safely without an ambiguous
       // duplicate-message boundary.
-      await db
-        .update(chatActions)
-        .set({
-          status: "failed",
-          result: {
-            ...(action.result ?? {}),
-            retryable: true,
-            retryAt: new Date().toISOString(),
-          },
-          updatedAt: new Date(),
-        })
-        .where(
-          and(
-            eq(chatActions.id, action.id),
-            eq(chatActions.status, "processing"),
-            eq(chatActions.updatedAt, action.updatedAt),
-          ),
-        );
+      await db.transaction(async (tx) => {
+        await notifyChatActionWork(tx, "receipt_reaction");
+        return tx
+          .update(chatActions)
+          .set({
+            status: "failed",
+            result: {
+              ...(action.result ?? {}),
+              retryable: true,
+              retryAt: new Date().toISOString(),
+            },
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(chatActions.id, action.id),
+              eq(chatActions.status, "processing"),
+              eq(chatActions.updatedAt, action.updatedAt),
+            ),
+          );
+      });
       action = await db
         .select()
         .from(chatActions)
@@ -3723,6 +3733,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     );
     const [claimed] = await db.transaction(async (tx) => {
       await credentialLease.assertOwned(tx);
+      await notifyChatActionWork(tx, "receipt_reaction");
       const rows = await tx
         .update(chatActions)
         .set({
@@ -3760,6 +3771,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       ) {
         await db.transaction(async (tx) => {
           await credentialLease.assertOwned(tx);
+          await notifyChatActionWork(tx, "receipt_reaction");
           await tx
             .update(chatActions)
             .set({
@@ -3853,6 +3865,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       // for an obsolete runtime.
       await db.transaction(async (tx) => {
         await credentialLease.assertOwned(tx);
+        await notifyChatActionWork(tx, "receipt_reaction");
         const processed = await tx
           .update(chatActions)
           .set({
@@ -3898,6 +3911,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       ) {
         await db.transaction(async (tx) => {
           await credentialLease.assertOwned(tx);
+          await notifyChatActionWork(tx, "receipt_reaction");
           const processed = await tx
             .update(chatActions)
             .set({
@@ -3957,6 +3971,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         : null;
       await db.transaction(async (tx) => {
         await credentialLease.assertOwned(tx);
+        await notifyChatActionWork(tx, "receipt_reaction");
         const [failed] = await tx
           .update(chatActions)
           .set({
@@ -4013,31 +4028,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     limit = 25,
     onlyActionId?: string,
   ) {
-    const now = new Date();
-    const staleBefore = new Date(now.getTime() - PROVIDER_EFFECT_STALE_MS);
-    const actions = await db
-      .select({ id: chatActions.id })
-      .from(chatActions)
-      .where(
-        and(
-          eq(chatActions.kind, "receipt_reaction"),
-          ...(onlyActionId ? [eq(chatActions.id, onlyActionId)] : []),
-          or(
-            eq(chatActions.status, "received"),
-            and(
-              eq(chatActions.status, "processing"),
-              lte(chatActions.updatedAt, staleBefore),
-            ),
-            and(
-              eq(chatActions.status, "failed"),
-              sql`coalesce(${chatActions.result}->>'retryable', 'false') = 'true'`,
-              sql`(${chatActions.result}->>'retryAt' is null or (${chatActions.result}->>'retryAt')::timestamptz <= ${now.toISOString()}::timestamptz)`,
-            ),
-          ),
-        ),
-      )
-      .orderBy(asc(chatActions.createdAt))
-      .limit(limit);
+    const actions = await db.select({ id: chatActions.id }).from(chatActions)
+      .where(and(dueChatAction("receipt_reaction"), onlyActionId ? eq(chatActions.id, onlyActionId) : undefined))
+      .orderBy(asc(chatActions.createdAt)).limit(limit);
     for (const action of actions) await processReceiptReaction(action.id);
     return actions.length;
   }
@@ -4590,6 +4583,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       runtimeContext: LifecycleRuntimeFence;
     },
   ) {
+    await notifyChatActionWork(database, "provider_effect");
     const [inserted] = await database
       .insert(chatActions)
       .values({
@@ -4727,6 +4721,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               ["verifying", "active"],
             )
           : null;
+      await notifyChatActionWork(tx, "provider_effect");
       const [ownedAction] = await tx
         .update(chatActions)
         .set({
@@ -4828,6 +4823,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     const failure =
       "Provider delivery could not be confirmed after the worker stopped. The effect will not be replayed automatically.";
     await db.transaction(async (tx) => {
+      await notifyChatActionWork(tx, "provider_effect");
       const [quarantined] = await tx
         .update(chatActions)
         .set({
@@ -5102,6 +5098,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     action: typeof chatActions.$inferSelect,
     attempt: number,
   ): Promise<boolean> {
+    await notifyChatActionWork(tx, "provider_effect");
     const [cancelled] = await tx
       .update(chatActions)
       .set({
@@ -5170,14 +5167,17 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       if (!action) return "failed";
       const payload = providerEffectPayload(action.payload);
       if (!payload) {
-        await db
-          .update(chatActions)
-          .set({
-            status: "failed",
-            result: { code: "provider_effect_payload_invalid" },
-            updatedAt: new Date(),
-          })
-          .where(eq(chatActions.id, action.id));
+        await db.transaction(async (tx) => {
+          await notifyChatActionWork(tx, "provider_effect");
+          return tx
+            .update(chatActions)
+            .set({
+              status: "failed",
+              result: { code: "provider_effect_payload_invalid" },
+              updatedAt: new Date(),
+            })
+            .where(eq(chatActions.id, action.id));
+        });
         return "failed";
       }
       if (action.status === "processed") return "processed";
@@ -5247,6 +5247,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                     payload,
                   )
                 : false;
+              await notifyChatActionWork(tx, "provider_effect");
               const [transportClaim] = await tx
                 .update(chatActions)
                 .set({
@@ -5364,6 +5365,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                 },
                 ["verifying", "active"],
               );
+              await notifyChatActionWork(tx, "provider_effect");
               const [completed] = await tx
                 .update(chatActions)
                 .set({
@@ -5490,23 +5492,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     const actions = await db
       .select()
       .from(chatActions)
-      .where(
-        and(
-          eq(chatActions.kind, "provider_effect"),
-          or(
-            eq(chatActions.status, "received"),
-            and(
-              eq(chatActions.status, "processing"),
-              lte(chatActions.updatedAt, staleBefore),
-            ),
-            and(
-              eq(chatActions.status, "failed"),
-              sql`coalesce(${chatActions.result}->>'retryable', 'false') = 'true'`,
-              sql`(${chatActions.result}->>'retryAt' is null or (${chatActions.result}->>'retryAt')::timestamptz <= ${now.toISOString()}::timestamptz)`,
-            ),
-          ),
-        ),
-      )
+      .where(dueChatAction("provider_effect", now.getTime()))
       .orderBy(asc(chatActions.createdAt))
       .limit(limit);
     for (const action of actions) {
@@ -11704,7 +11690,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       delivery.conversationId !== action.conversationId ||
       delivery.principalId !== action.principalId ||
       !fence ||
-      !(await runtimeCallbackEndpoint(tx as DbTransaction, endpoint.id, fence, [
+      !(await runtimeCallbackEndpoint(tx as unknown as DbTransaction, endpoint.id, fence, [
         "verifying",
         "active",
       ]))
@@ -12216,7 +12202,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     )
       throw failedChatRetryDenied();
     const evidence = await nativeProviderRecoveryEvidence({
-      db: tx as Db,
+      db: tx as unknown as Db,
       runId: run.id,
       sourceFailureCode: detail.originalFailureCode as Parameters<
         typeof nativeProviderRecoveryEvidence
@@ -13102,7 +13088,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         updatedAt: now,
       })
       .returning();
-    await logActivity(tx as Db, {
+    await logActivity(tx as unknown as Db, {
       companyId: input.companyId,
       actorType: "user",
       actorId: input.initiatedByUserId,
@@ -13630,6 +13616,11 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     publication: typeof chatPublications.$inferSelect,
   ): Promise<boolean> {
     if (!(await canPublishIssueToChatAudience(tx, publication))) return false;
+    if (publication.idempotencyKey.startsWith("fast-response:")) {
+      const [request] = await tx.select().from(fastResponseRequests).where(and(eq(fastResponseRequests.companyId, publication.companyId), eq(fastResponseRequests.id, publication.idempotencyKey.slice("fast-response:".length))));
+      if (!request || request.commentId !== publication.commentId || request.endpointId !== publication.endpointId || request.conversationId !== publication.conversationId || !(await fastResponseSourceCurrent(tx as unknown as Db, request))) return false;
+      try { await fastResponseService(tx as unknown as Db).authorize(tx as unknown as Db, request); await authorizeFastResponse(tx as unknown as Db, request); return true; } catch { return false; }
+    }
     const notice = parseInboundWakePublicationKey(publication.idempotencyKey);
     let runId = runIdFromMilestonePublication(publication);
     if (!runId && publication.commentId && !notice) {
@@ -14184,11 +14175,12 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           );
         }
         await notifyChatDeliveryWork(tx);
+        const acceptedAt = new Date();
         const accepted = await tx
           .update(chatDeliveries)
           .set({
             state: "processed",
-            processedAt: new Date(),
+            processedAt: acceptedAt,
             redactedError: attachmentOmissionDetail(attachmentResult),
             nextAttemptAt: null,
             updatedAt: new Date(),
@@ -14226,6 +14218,13 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           .returning({ id: chatActions.id });
         if (issued.length !== 1)
           throw new Error("chat_inbound_wakeup_action_claim_lost");
+        const source = delivery.normalizedEvent as { githubAutomatic?: unknown; principal?: { isBot?: boolean }; message?: { text?: string } };
+        if (!source.githubAutomatic && !source.principal?.isBot && !/^\s*\//.test(source.message?.text ?? "")) {
+          await enqueueFastResponse(tx as unknown as Db, { companyId: action.companyId, issueId: String(action.payload.issueId), agentId: String(action.payload.agentId),
+            sourceCommentId: String(action.payload.commentId), sourceKey: `comment:${action.payload.commentId}`, acceptedAt,
+            responsibleUserId: action.payload.requestedByActorType === "user" ? String(action.payload.requestedByActorId) : null,
+            sponsored: action.payload.requestedByActorType !== "user", endpointId: action.endpointId, conversationId: action.conversationId, deliveryId: action.deliveryId });
+        }
       }),
     );
   }
@@ -14270,6 +14269,20 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       });
     }
     return current;
+  }
+
+  async function authorizeFastResponse(tx: Db, request: typeof fastResponseRequests.$inferSelect) {
+    const [action] = await tx.select().from(chatActions).where(and(eq(chatActions.companyId, request.companyId), eq(chatActions.deliveryId, request.deliveryId!), eq(chatActions.kind, "inbound_wakeup")));
+    if (!action || action.endpointId !== request.endpointId || action.conversationId !== request.conversationId || action.payload.commentId !== request.sourceCommentId || action.payload.agentId !== request.agentId || action.payload.issueId !== request.issueId) throw forbidden();
+    const current = await authorizeInboundWorkStart(tx, action);
+    const normalized = current.delivery.normalizedEvent as { message?: { text?: string; attachments?: Array<{ name?: string; mimeType?: string }> }; principal?: { isBot?: boolean } };
+    if (normalized.principal?.isBot || current.delivery.normalizedEvent.githubAutomatic || current.delivery.state !== "processed") throw forbidden();
+    if ((action.payload.requestedByActorType === "user" ? action.payload.requestedByActorId : null) !== request.responsibleUserId) throw forbidden();
+    const [agent] = await tx.select({ name: agents.name }).from(agents).where(and(eq(agents.id, request.agentId!), eq(agents.companyId, request.companyId)));
+    const [receipt] = await tx.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, action.id));
+    if (receipt && ["skipped", "cancelled", "failed"].includes(receipt.status)) throw forbidden();
+    return { agentName: agent?.name ?? "Assistant", message: normalized.message?.text ?? "Shared an attachment.", queued: !receipt?.runId || await fastResponseTurnQueued(tx, request),
+      attachments: normalized.message?.attachments?.map(a => `${a.name ?? "Attachment"} (${a.mimeType ?? "unknown type"})`) };
   }
 
   async function processInboundWakeup(deliveryId: string): Promise<boolean> {
@@ -14711,6 +14724,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       ...(githubIssue ? { githubIssue } : {}),
       ...(githubManual ? { githubManual } : {}),
       principal: {
+        // Bot/system authors have already been rejected at this intake boundary.
+        isBot: false,
         externalId: stableExternalPrincipalId(
           endpoint.provider,
           message.author,
@@ -22225,6 +22240,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     );
     const finalized = await db.transaction(async (tx) => {
       await input.credentialLease.assertOwned(tx);
+      await notifyChatActionWork(tx, "slash_task_start");
       const [ownedAction] = await tx
         .update(chatActions)
         .set({
@@ -22320,28 +22336,31 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     const staleAdmission = new Date(
       Date.now() - SLACK_COMMAND_ADMISSION_STALE_MS,
     );
-    const [action] = await db
-      .update(chatActions)
-      .set({
-        status: "admitting",
-        result: sql`coalesce(${chatActions.result}, '{}'::jsonb)
-          || jsonb_build_object('admissionClaimId', ${admissionClaimId}::text)`,
-        updatedAt: new Date(),
-      })
-      .where(
-        and(
-          eq(chatActions.id, actionId),
-          eq(chatActions.kind, "slash_task_start"),
-          or(
-            eq(chatActions.status, "provider_confirmed"),
-            and(
-              eq(chatActions.status, "admitting"),
-              lte(chatActions.updatedAt, staleAdmission),
+    const [action] = await db.transaction(async (tx) => {
+      await notifyChatActionWork(tx, "slash_task_start");
+      return tx
+        .update(chatActions)
+        .set({
+          status: "admitting",
+          result: sql`coalesce(${chatActions.result}, '{}'::jsonb)
+            || jsonb_build_object('admissionClaimId', ${admissionClaimId}::text)`,
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(chatActions.id, actionId),
+            eq(chatActions.kind, "slash_task_start"),
+            or(
+              eq(chatActions.status, "provider_confirmed"),
+              and(
+                eq(chatActions.status, "admitting"),
+                lte(chatActions.updatedAt, staleAdmission),
+              ),
             ),
           ),
-        ),
-      )
-      .returning();
+        )
+        .returning();
+    });
     if (!action) return false;
     await options.slackTaskAdmissionClaimBarrier?.({
       actionId: action.id,
@@ -22357,18 +22376,21 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         sql`${chatActions.result}->>'admissionClaimId' = ${admissionClaimId}`,
       );
     const failAdmission = async (code: string, detail: string) => {
-      await db
-        .update(chatActions)
-        .set({
-          status: "failed",
-          result: {
-            ...(confirmed ?? {}),
-            code,
-            redactedError: redactSensitiveText(detail).slice(0, MAX_ERROR_TEXT),
-          },
-          updatedAt: new Date(),
-        })
-        .where(ownsAdmission());
+      await db.transaction(async (tx) => {
+        await notifyChatActionWork(tx, "slash_task_start");
+        return tx
+          .update(chatActions)
+          .set({
+            status: "failed",
+            result: {
+              ...(confirmed ?? {}),
+              code,
+              redactedError: redactSensitiveText(detail).slice(0, MAX_ERROR_TEXT),
+            },
+            updatedAt: new Date(),
+          })
+          .where(ownsAdmission());
+      });
     };
     if (!recovery || !confirmed || !action.principalId) {
       await failAdmission(
@@ -22396,14 +22418,17 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         // The provider-visible send is already confirmed. Wait for an
         // operator to repair/resume the endpoint, then continue Paperclip-only
         // admission without sending another Slack message.
-        await db
-          .update(chatActions)
-          .set({
-            status: "provider_confirmed",
-            result: confirmed,
-            updatedAt: new Date(),
-          })
-          .where(ownsAdmission());
+        await db.transaction(async (tx) => {
+          await notifyChatActionWork(tx, "slash_task_start");
+          return tx
+            .update(chatActions)
+            .set({
+              status: "provider_confirmed",
+              result: confirmed,
+              updatedAt: new Date(),
+            })
+            .where(ownsAdmission());
+        });
       }
       return true;
     }
@@ -22468,27 +22493,34 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         false,
         true,
       );
-      await db
-        .update(chatActions)
-        .set({ status: "processed", result: confirmed, updatedAt: new Date() })
-        .where(ownsAdmission());
+      await db.transaction(async (tx) => {
+        await notifyChatActionWork(tx, "slash_task_start");
+        return tx
+          .update(chatActions)
+          .set({ status: "processed", result: confirmed, updatedAt: new Date() })
+          .where(ownsAdmission());
+      });
       return true;
     } catch (error) {
       // The provider post is already confirmed, so this retry is strictly a
       // Paperclip admission retry. Preserve the root tuple and let the durable
       // reconciler resume without ever posting to Slack again.
-      await db
-        .update(chatActions)
-        .set({
-          status: "provider_confirmed",
-          result: {
-            ...confirmed,
-            code: "slash_task_admission_retry",
-            redactedError: redactError(error),
-          },
-          updatedAt: new Date(),
-        })
-        .where(ownsAdmission());
+      await db.transaction(async (tx) => {
+        await notifyChatActionWork(tx, "slash_task_start");
+        return tx
+          .update(chatActions)
+          .set({
+            status: "provider_confirmed",
+            result: {
+              ...confirmed,
+              code: "slash_task_admission_retry",
+              retryAt: new Date(Date.now() + 1_000).toISOString(),
+              redactedError: redactError(error),
+            },
+            updatedAt: new Date(),
+          })
+          .where(ownsAdmission());
+      });
       throw error;
     }
   }
@@ -22527,6 +22559,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           async (credentialLease) => {
             await db.transaction(async (tx) => {
               await credentialLease.assertOwned(tx);
+              await notifyChatActionWork(tx, "slash_task_start");
               await tx
                 .update(chatActions)
                 .set({
@@ -22569,6 +22602,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           async (credentialLease) => {
             await db.transaction(async (tx) => {
               await credentialLease.assertOwned(tx);
+              await notifyChatActionWork(tx, "slash_task_start");
               await tx
                 .update(chatActions)
                 .set({ status: "queued", updatedAt: new Date() })
@@ -22608,21 +22642,24 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         ? Math.max(0, action.result.attemptCount)
         : 0) + 1;
 
-    const [claimed] = await db
-      .update(chatActions)
-      .set({
-        status: "validating",
-        result: { attemptCount: attempt },
-        updatedAt: new Date(),
-      })
-      .where(
-        and(
-          eq(chatActions.id, action.id),
-          eq(chatActions.kind, "slash_task_start"),
-          eq(chatActions.status, action.status),
-        ),
-      )
-      .returning();
+    const [claimed] = await db.transaction(async (tx) => {
+      await notifyChatActionWork(tx, "slash_task_start");
+      return tx
+        .update(chatActions)
+        .set({
+          status: "validating",
+          result: { attemptCount: attempt },
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(chatActions.id, action.id),
+            eq(chatActions.kind, "slash_task_start"),
+            eq(chatActions.status, action.status),
+          ),
+        )
+        .returning();
+    });
     if (!claimed) return false;
     action = claimed;
 
@@ -22633,24 +22670,27 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       !initialRecord ||
       initialRecord.endpoint.provider !== "slack"
     ) {
-      await db
-        .update(chatActions)
-        .set({
-          status: "failed",
-          result: {
-            code: "slash_task_provider_context_missing",
-            retryable: false,
-            attemptCount: attempt,
-          },
-          updatedAt: new Date(),
-        })
-        .where(
-          and(
-            eq(chatActions.id, action.id),
-            eq(chatActions.status, "validating"),
-            sql`(${chatActions.result}->>'attemptCount')::int = ${attempt}`,
-          ),
-        );
+      await db.transaction(async (tx) => {
+        await notifyChatActionWork(tx, "slash_task_start");
+        return tx
+          .update(chatActions)
+          .set({
+            status: "failed",
+            result: {
+              code: "slash_task_provider_context_missing",
+              retryable: false,
+              attemptCount: attempt,
+            },
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(chatActions.id, action.id),
+              eq(chatActions.status, "validating"),
+              sql`(${chatActions.result}->>'attemptCount')::int = ${attempt}`,
+            ),
+          );
+      });
       return true;
     }
     let providerPostStarted = false;
@@ -22665,53 +22705,59 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         async (credentialLease) => {
           const record = await endpointRecord(action.endpointId);
           if (!record || record.endpoint.provider !== "slack") {
-            await db
-              .update(chatActions)
-              .set({
-                status: "failed",
-                result: {
-                  code: "slash_task_provider_context_missing",
-                  retryable: false,
-                  attemptCount: attempt,
-                },
-                updatedAt: new Date(),
-              })
-              .where(
-                and(
-                  eq(chatActions.id, action.id),
-                  eq(chatActions.status, "validating"),
-                  sql`(${chatActions.result}->>'attemptCount')::int = ${attempt}`,
-                ),
-              );
+            await db.transaction(async (tx) => {
+              await notifyChatActionWork(tx, "slash_task_start");
+              return tx
+                .update(chatActions)
+                .set({
+                  status: "failed",
+                  result: {
+                    code: "slash_task_provider_context_missing",
+                    retryable: false,
+                    attemptCount: attempt,
+                  },
+                  updatedAt: new Date(),
+                })
+                .where(
+                  and(
+                    eq(chatActions.id, action.id),
+                    eq(chatActions.status, "validating"),
+                    sql`(${chatActions.result}->>'attemptCount')::int = ${attempt}`,
+                  ),
+                );
+            });
             return true;
           }
           failureRuntimeFence = runtimeContextForRecord(record);
           if (!["verifying", "active"].includes(record.endpoint.status)) {
             const terminallyArchived = record.endpoint.status === "archived";
-            await db
-              .update(chatActions)
-              .set({
-                status: terminallyArchived ? "cancelled" : "queued",
-                result: {
-                  code: terminallyArchived
-                    ? "slash_task_endpoint_archived"
-                    : "slash_task_endpoint_waiting",
-                  attemptCount: attempt - 1,
-                  ...(terminallyArchived
-                    ? {}
-                    : {
-                        retryAt: new Date(Date.now() + 5_000).toISOString(),
-                      }),
-                },
-                updatedAt: new Date(),
-              })
-              .where(
-                and(
-                  eq(chatActions.id, action.id),
-                  eq(chatActions.status, "validating"),
-                  sql`(${chatActions.result}->>'attemptCount')::int = ${attempt}`,
-                ),
-              );
+            await db.transaction(async (tx) => {
+              await notifyChatActionWork(tx, "slash_task_start");
+              return tx
+                .update(chatActions)
+                .set({
+                  status: terminallyArchived ? "cancelled" : "queued",
+                  result: {
+                    code: terminallyArchived
+                      ? "slash_task_endpoint_archived"
+                      : "slash_task_endpoint_waiting",
+                    attemptCount: attempt - 1,
+                    ...(terminallyArchived
+                      ? {}
+                      : {
+                          retryAt: new Date(Date.now() + 5_000).toISOString(),
+                        }),
+                  },
+                  updatedAt: new Date(),
+                })
+                .where(
+                  and(
+                    eq(chatActions.id, action.id),
+                    eq(chatActions.status, "validating"),
+                    sql`(${chatActions.result}->>'attemptCount')::int = ${attempt}`,
+                  ),
+                );
+            });
             return false;
           }
 
@@ -22786,23 +22832,26 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             ? record.endpoint.allowDirectMessages
             : nonDirectDestinationAllowed(record.endpoint, resource);
           if (!principalAllowed || !destinationAllowed) {
-            await db
-              .update(chatActions)
-              .set({
-                status: "cancelled",
-                result: {
-                  code: "slash_task_no_longer_authorized",
-                  attemptCount: attempt,
-                },
-                updatedAt: new Date(),
-              })
-              .where(
-                and(
-                  eq(chatActions.id, action.id),
-                  eq(chatActions.status, "validating"),
-                  sql`(${chatActions.result}->>'attemptCount')::int = ${attempt}`,
-                ),
-              );
+            await db.transaction(async (tx) => {
+              await notifyChatActionWork(tx, "slash_task_start");
+              return tx
+                .update(chatActions)
+                .set({
+                  status: "cancelled",
+                  result: {
+                    code: "slash_task_no_longer_authorized",
+                    attemptCount: attempt,
+                  },
+                  updatedAt: new Date(),
+                })
+                .where(
+                  and(
+                    eq(chatActions.id, action.id),
+                    eq(chatActions.status, "validating"),
+                    sql`(${chatActions.result}->>'attemptCount')::int = ${attempt}`,
+                  ),
+                );
+            });
             return true;
           }
 
@@ -22854,6 +22903,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               !currentAuthorization?.allowed ||
               !currentDestinationAllowed
             ) {
+              await notifyChatActionWork(tx, "slash_task_start");
               await tx
                 .update(chatActions)
                 .set({
@@ -22875,6 +22925,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             }
 
             failureResource = currentResource;
+            await notifyChatActionWork(tx, "slash_task_start");
             const [transportClaim] = await tx
               .update(chatActions)
               .set({
@@ -22933,6 +22984,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           const threadId = slackTaskStarterThreadId(rawChannelId, starter.id);
           const [providerConfirmed] = await db.transaction(async (tx) => {
             await credentialLease.assertOwned(tx);
+            await notifyChatActionWork(tx, "slash_task_start");
             return tx
               .update(chatActions)
               .set({
@@ -22996,62 +23048,11 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     }
   }
 
-  async function processPendingSlackTaskStarts(limit: number) {
-    const now = new Date();
-    const staleAdmission = new Date(
-      now.getTime() - SLACK_COMMAND_ADMISSION_STALE_MS,
-    );
-    const staleProviderPost = new Date(
-      now.getTime() - SLACK_COMMAND_EXPLICIT_RETRY_STALE_MS,
-    );
-    const staleValidation = new Date(
-      now.getTime() - SLACK_COMMAND_POST_STALE_MS,
-    );
-    const actions = await db
-      .select({ id: chatActions.id })
-      .from(chatActions)
-      .leftJoin(chatEndpoints, eq(chatEndpoints.id, chatActions.endpointId))
-      .where(
-        // Provider-confirmed rows need no provider retry and have no due
-        // timestamp. Park them while an endpoint is repairable but paused
-        // or in attention; otherwise an old page can starve active work
-        // forever. Archived and missing endpoints remain eligible so their
-        // actions can be terminalized.
-        and(
-          eq(chatActions.kind, "slash_task_start"),
-          or(
-            and(
-              eq(chatActions.status, "queued"),
-              sql`(${chatActions.result}->>'retryAt' is null or ${chatActions.result}->>'retryAt' <= ${now.toISOString()})`,
-            ),
-            and(
-              eq(chatActions.status, "provider_confirmed"),
-              or(
-                isNull(chatEndpoints.id),
-                inArray(chatEndpoints.status, [
-                  "verifying",
-                  "active",
-                  "archived",
-                ]),
-              ),
-            ),
-            and(
-              eq(chatActions.status, "admitting"),
-              lte(chatActions.updatedAt, staleAdmission),
-            ),
-            and(
-              eq(chatActions.status, "resolving"),
-              lte(chatActions.updatedAt, staleProviderPost),
-            ),
-            and(
-              eq(chatActions.status, "validating"),
-              lte(chatActions.updatedAt, staleValidation),
-            ),
-          ),
-        ),
-      )
-      .orderBy(asc(chatActions.createdAt))
-      .limit(limit);
+  async function processPendingSlackTaskStarts(limit = 25) {
+    const actions = await db.select({ id: chatActions.id }).from(chatActions)
+      .leftJoin(chatEndpoints, and(eq(chatEndpoints.id, chatActions.endpointId), eq(chatEndpoints.companyId, chatActions.companyId)))
+      .where(dueChatAction("slash_task_start"))
+      .orderBy(asc(chatActions.createdAt)).limit(limit);
     let processed = 0;
     for (let offset = 0; offset < actions.length; offset += 4) {
       const results = await Promise.all(
@@ -23769,6 +23770,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             ))
           )
             return null;
+          await notifyChatActionWork(tx, "slash_task_start");
           return tx
             .insert(chatActions)
             .values({
@@ -25224,6 +25226,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           runtimeGeneration: context.generation,
           credentialFingerprint: context.credentialFingerprint,
         };
+        await notifyChatActionWork(tx, "github_webhook_ingress");
         const inserted = await tx
           .insert(chatActions)
           .values({
@@ -25250,6 +25253,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         // currently authenticated body after a terminal processing failure.
         // Successful, cancelled, retryable, and in-flight receipts remain
         // immutable deduplication fences.
+        await notifyChatActionWork(tx, "github_webhook_ingress");
         const [rearmed] = await tx
           .update(chatActions)
           .set({
@@ -25333,32 +25337,35 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       Date.now() +
         Math.min(60_000, 1_000 * 2 ** Math.max(0, input.attempts - 1)),
     );
-    await db
-      .update(chatActions)
-      .set({
-        status: cancelled ? "cancelled" : processed ? "processed" : "failed",
-        payload: terminal
-          ? redactedGitHubWebhookIngressPayload(input.payload)
-          : input.payload,
-        result: {
-          attempts: input.attempts,
-          ...(input.cancelledCode ? { code: input.cancelledCode } : {}),
-          ...(input.response
-            ? { httpStatus: input.response.status }
-            : { error: redactError(input.error) }),
-          retryable: !terminal,
-          ...(!terminal ? { retryAt: retryAt.toISOString() } : {}),
-        },
-        updatedAt: new Date(),
-      })
-      .where(
-        and(
-          eq(chatActions.id, actionId),
-          eq(chatActions.kind, "github_webhook_ingress"),
-          eq(chatActions.status, "processing"),
-          sql`(${chatActions.result}->>'attempts')::int = ${input.attempts}`,
-        ),
-      );
+    await db.transaction(async (tx) => {
+      await notifyChatActionWork(tx, "github_webhook_ingress");
+      return tx
+        .update(chatActions)
+        .set({
+          status: cancelled ? "cancelled" : processed ? "processed" : "failed",
+          payload: terminal
+            ? redactedGitHubWebhookIngressPayload(input.payload)
+            : input.payload,
+          result: {
+            attempts: input.attempts,
+            ...(input.cancelledCode ? { code: input.cancelledCode } : {}),
+            ...(input.response
+              ? { httpStatus: input.response.status }
+              : { error: redactError(input.error) }),
+            retryable: !terminal,
+            ...(!terminal ? { retryAt: retryAt.toISOString() } : {}),
+          },
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(chatActions.id, actionId),
+            eq(chatActions.kind, "github_webhook_ingress"),
+            eq(chatActions.status, "processing"),
+            sql`(${chatActions.result}->>'attempts')::int = ${input.attempts}`,
+          ),
+        );
+    });
   }
 
   async function processGitHubWebhookIngress(
@@ -25382,18 +25389,21 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       return githubIngressAcceptedResponse();
     const payload = githubWebhookIngressPayload(action.payload);
     if (!payload) {
-      await db
-        .update(chatActions)
-        .set({
-          status: "failed",
-          payload: {},
-          result: {
-            code: "github_webhook_ingress_payload_invalid",
-            retryable: false,
-          },
-          updatedAt: new Date(),
-        })
-        .where(eq(chatActions.id, action.id));
+      await db.transaction(async (tx) => {
+        await notifyChatActionWork(tx, "github_webhook_ingress");
+        return tx
+          .update(chatActions)
+          .set({
+            status: "failed",
+            payload: {},
+            result: {
+              code: "github_webhook_ingress_payload_invalid",
+              retryable: false,
+            },
+            updatedAt: new Date(),
+          })
+          .where(eq(chatActions.id, action.id));
+      });
       return githubIngressAcceptedResponse();
     }
     const now = new Date();
@@ -25428,21 +25438,24 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               sql`coalesce((${chatActions.result}->>'attempts')::int, 0) = ${previousAttempts}`,
             )
           : eq(chatActions.status, "received");
-    const [claimed] = await db
-      .update(chatActions)
-      .set({
-        status: "processing",
-        result: { attempts },
-        updatedAt: now,
-      })
-      .where(
-        and(
-          eq(chatActions.id, action.id),
-          eq(chatActions.kind, "github_webhook_ingress"),
-          claimGuard,
-        ),
-      )
-      .returning();
+    const [claimed] = await db.transaction(async (tx) => {
+      await notifyChatActionWork(tx, "github_webhook_ingress");
+      return tx
+        .update(chatActions)
+        .set({
+          status: "processing",
+          result: { attempts },
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(chatActions.id, action.id),
+            eq(chatActions.kind, "github_webhook_ingress"),
+            claimGuard,
+          ),
+        )
+        .returning();
+    });
     if (!claimed) return null;
     action = claimed;
 
@@ -26213,28 +26226,13 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     onlyActionId?: string,
   ) {
     const now = new Date();
-    const staleBefore = new Date(now.getTime() - PROVIDER_EFFECT_STALE_MS);
     const actions = await db
       .select({ id: chatActions.id })
       .from(chatActions)
-      .where(
-        and(
-          eq(chatActions.kind, "github_webhook_ingress"),
-          ...(onlyActionId ? [eq(chatActions.id, onlyActionId)] : []),
-          or(
-            eq(chatActions.status, "received"),
-            and(
-              eq(chatActions.status, "processing"),
-              lte(chatActions.updatedAt, staleBefore),
-            ),
-            and(
-              eq(chatActions.status, "failed"),
-              sql`coalesce(${chatActions.result}->>'retryable', 'false') = 'true'`,
-              sql`(${chatActions.result}->>'retryAt' is null or (${chatActions.result}->>'retryAt')::timestamptz <= ${now.toISOString()}::timestamptz)`,
-            ),
-          ),
-        ),
-      )
+      .where(and(
+        onlyActionId ? eq(chatActions.id, onlyActionId) : undefined,
+        dueChatAction("github_webhook_ingress", now.getTime()),
+      ))
       .orderBy(asc(chatActions.createdAt))
       .limit(limit);
     for (const action of actions) await processGitHubWebhookIngress(action.id);
@@ -26384,6 +26382,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         threadId: event.threadId,
         userId: event.userId,
       };
+      await notifyChatActionWork(tx, "slack_session_stop");
       const [inserted] = await tx
         .insert(chatActions)
         .values({
@@ -26452,18 +26451,21 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         : 0;
     const attempts = previousAttempts + 1;
     if (!payload) {
-      await db
-        .update(chatActions)
-        .set({
-          status: "failed",
-          result: {
-            attempts,
-            code: "slack_session_stop_payload_invalid",
-            retryable: false,
-          },
-          updatedAt: now,
-        })
-        .where(eq(chatActions.id, action.id));
+      await db.transaction(async (tx) => {
+        await notifyChatActionWork(tx, "slack_session_stop");
+        return tx
+          .update(chatActions)
+          .set({
+            status: "failed",
+            result: {
+              attempts,
+              code: "slack_session_stop_payload_invalid",
+              retryable: false,
+            },
+            updatedAt: now,
+          })
+          .where(eq(chatActions.id, action.id));
+      });
       return;
     }
 
@@ -26501,6 +26503,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         actorUserId: string | null,
         targetKind: "run" | "wakeup" | "none",
       ): Promise<StopClaim> => {
+        await notifyChatActionWork(tx, "slack_session_stop");
         await tx
           .update(chatActions)
           .set({
@@ -26740,6 +26743,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         }
         runId = wakeup?.runId ?? null;
         if (!runId && wakeup?.status === "claimed") {
+          await notifyChatActionWork(tx, "slack_session_stop");
           await tx
             .update(chatActions)
             .set({
@@ -26808,6 +26812,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           "run",
         );
       }
+      await notifyChatActionWork(tx, "slack_session_stop");
       await tx
         .update(chatActions)
         .set({
@@ -26857,6 +26862,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         .then((rows) => rows[0] ?? null);
       const cancellationWon = authoritativeRun?.status === "cancelled";
       await db.transaction(async (tx) => {
+        await notifyChatActionWork(tx, "slack_session_stop");
         const [settled] = await tx
           .update(chatActions)
           .set({
@@ -26902,32 +26908,35 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       });
     } catch (error) {
       const retryable = attempts < 5;
-      await db
-        .update(chatActions)
-        .set({
-          status: "failed",
-          result: {
-            attempts,
-            code: "slack_session_stop_cancellation_failed",
-            retryable,
-            ...(retryable
-              ? {
-                  retryAt: new Date(
-                    Date.now() + Math.min(60_000, 1_000 * 2 ** (attempts - 1)),
-                  ).toISOString(),
-                }
-              : {}),
-          },
-          updatedAt: new Date(),
-        })
-        .where(
-          and(
-            eq(chatActions.id, action.id),
-            eq(chatActions.status, "processing"),
-            sql`(${chatActions.result}->>'attempts')::int = ${attempts}`,
-            sql`${chatActions.result}->>'runId' = ${claim.runId}`,
-          ),
-        );
+      await db.transaction(async (tx) => {
+        await notifyChatActionWork(tx, "slack_session_stop");
+        return tx
+          .update(chatActions)
+          .set({
+            status: "failed",
+            result: {
+              attempts,
+              code: "slack_session_stop_cancellation_failed",
+              retryable,
+              ...(retryable
+                ? {
+                    retryAt: new Date(
+                      Date.now() + Math.min(60_000, 1_000 * 2 ** (attempts - 1)),
+                    ).toISOString(),
+                  }
+                : {}),
+            },
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(chatActions.id, action.id),
+              eq(chatActions.status, "processing"),
+              sql`(${chatActions.result}->>'attempts')::int = ${attempts}`,
+              sql`${chatActions.result}->>'runId' = ${claim.runId}`,
+            ),
+          );
+      });
       logger.warn(
         {
           actionId: action.id,
@@ -26944,31 +26953,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     limit = 25,
     onlyActionId?: string,
   ) {
-    const now = new Date();
-    const staleBefore = new Date(now.getTime() - PROVIDER_EFFECT_STALE_MS);
-    const actions = await db
-      .select({ id: chatActions.id })
-      .from(chatActions)
-      .where(
-        and(
-          eq(chatActions.kind, "slack_session_stop"),
-          ...(onlyActionId ? [eq(chatActions.id, onlyActionId)] : []),
-          or(
-            eq(chatActions.status, "received"),
-            and(
-              eq(chatActions.status, "processing"),
-              lte(chatActions.updatedAt, staleBefore),
-            ),
-            and(
-              eq(chatActions.status, "failed"),
-              sql`coalesce(${chatActions.result}->>'retryable', 'false') = 'true'`,
-              sql`(${chatActions.result}->>'retryAt' is null or (${chatActions.result}->>'retryAt')::timestamptz <= ${now.toISOString()}::timestamptz)`,
-            ),
-          ),
-        ),
-      )
-      .orderBy(asc(chatActions.createdAt))
-      .limit(limit);
+    const actions = await db.select({ id: chatActions.id }).from(chatActions)
+      .where(and(dueChatAction("slack_session_stop"), onlyActionId ? eq(chatActions.id, onlyActionId) : undefined))
+      .orderBy(asc(chatActions.createdAt)).limit(limit);
     for (const action of actions) await processSlackSessionStop(action.id);
     return actions.length;
   }
@@ -27004,6 +26991,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       const observedAt = new Date();
       const setup = current.setup as InternalSetupState;
       const matchesCurrentUrl = slackCallbackMatchesPublicUrl(callback.url, `${getWebhookPublicBaseUrl()}/api/chat-webhooks/${current.publicId}/slack`);
+      await notifyChatVerificationWork(tx);
       await tx.update(chatEndpoints).set({ setup: {
         ...setup,
         ...(matchesCurrentUrl ? { webhookVerifiedAt: setup.webhookVerifiedAt ?? observedAt.toISOString(),
@@ -27621,6 +27609,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             }
           }
           connectionProved = signingFingerprint !== null;
+          if (connectionProved) await notifyChatVerificationWork(tx);
           await tx
             .update(chatEndpoints)
             .set({
@@ -28044,7 +28033,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
   async function processPendingSlackBoardMessages(limit = 25) {
     const pending = await db.select({ id: chatActions.id, companyId: chatActions.companyId, endpointId: chatActions.endpointId }).from(chatActions)
       .innerJoin(chatEndpoints, and(eq(chatEndpoints.id, chatActions.endpointId), eq(chatEndpoints.companyId, chatActions.companyId)))
-      .where(and(eq(chatActions.kind, "slack_board_message"), eq(chatActions.status, "received"), notInArray(chatEndpoints.status, ["paused", "attention"])))
+      .where(dueChatAction("slack_board_message"))
       .orderBy(asc(chatActions.createdAt)).limit(limit);
     for (const candidate of pending) {
       await withSlackBoardLease(db, { ...candidate, actionId: candidate.id }, fetchImpl, async (lease) => {
@@ -28056,6 +28045,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         const commentId = String(action.payload.commentId);
         async function cancelWork(message: string) {
           await lease.commit(async (tx) => {
+            await notifyChatActionWork(tx, "slack_board_message");
             await tx.update(chatActions).set({ status: "cancelled", result: { code: "slack_board_work_not_authorized", message }, updatedAt: new Date() }).where(eq(chatActions.id, action.id));
             await notifyChatPublicationWork(tx);
             await tx.update(chatPublications).set({ state: "cancelled", redactedError: message, nextAttemptAt: null, updatedAt: new Date() }).where(and(
@@ -28090,6 +28080,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                 await issueService(tx as unknown as Db).update(current.id, { status: "todo", actorUserId: userId });
                 await logActivity(tx as unknown as Db, { companyId: current.companyId, actorType: "user", actorId: userId, action: "issue.updated", entityType: "issue", entityId: current.id, details: { status: "todo", source: "slack_board_message" } });
               }
+              await notifyChatActionWork(tx, "slack_board_message");
               await tx.update(chatActions).set({ result: { resumeApplied: true }, updatedAt: new Date() }).where(eq(chatActions.id, action.id));
             }
             return current;
@@ -28104,6 +28095,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           });
           await lease.commit(async (tx) => {
             await notifyChatPublicationWork(tx);
+            await notifyChatActionWork(tx, "slack_board_message");
             await tx.update(chatActions).set({ status: "processed", updatedAt: new Date() }).where(eq(chatActions.id, action.id));
           });
         } catch (error) {
@@ -28119,17 +28111,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
 
   async function processPendingChatMaintenance(limit = 25) {
     return Promise.allSettled([
-      processPendingSlackBoardMessages(limit),
-      processPendingGitHubWebhookIngress(limit),
-      processPendingProviderEffects(limit),
-      slackRegistration.processPendingVerificationMessages(limit),
-      processPendingReceiptReactions(limit),
-      processPendingSlackSessionStops(limit),
       processPendingTelegramMaintenance(limit),
-      // Slack task starts are an action-backed outbox. Queued work may
-      // post once; provider-confirmed rows perform Paperclip-only
-      // admission; a stale in-flight post is quarantined as unknown.
-      processPendingSlackTaskStarts(limit),
       processFailedChatRunRetries(limit),
     ]);
   }
@@ -28140,7 +28122,12 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     // chat_actions as their outbox. Reconcile them before inbound deliveries
     // so a crashed processing claim is quarantined before the delivery worker
     // could otherwise replay it.
-    const actionRecovery = onlyDeliveryId || !maintenance ? null : processPendingChatMaintenance(limit);
+    const actionRecovery = onlyDeliveryId || !maintenance ? null : Promise.allSettled([
+      processPendingChatMaintenance(limit), processPendingGitHubWebhookIngress(limit),
+      processPendingProviderEffects(limit), processPendingSlackBoardMessages(limit),
+      processPendingSlackTaskStarts(limit), processPendingReceiptReactions(limit),
+      processPendingSlackSessionStops(limit), slackRegistration.processPendingVerificationMessages(limit),
+    ]);
     const reactionRecovery = processPendingReactionDeliveries(
       limit,
       onlyDeliveryId,
@@ -30140,6 +30127,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                 );
             }
             const now = new Date();
+            await notifyChatActionWork(tx, "provider_effect");
             const [claimed] = await tx
               .update(chatActions)
               .set({
@@ -30251,6 +30239,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           const now = new Date();
           const nextStatus =
             resolution === "mark_delivered" ? "processed" : "cancelled";
+          await notifyChatActionWork(tx, "provider_effect");
           const [resolved] = await tx
             .update(chatActions)
             .set({
@@ -30386,6 +30375,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         async (credentialLease) => {
           await db.transaction(async (tx) => {
             await credentialLease.assertOwned(tx);
+            await notifyChatActionWork(tx, "slash_task_start");
             await tx
               .update(chatActions)
               .set({
@@ -30441,6 +30431,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               );
             }
             const now = new Date();
+            await notifyChatActionWork(tx, "slash_task_start");
             await tx
               .update(chatActions)
               .set({
@@ -30625,6 +30616,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             : 0) + 1;
         const [claimed] = await db.transaction(async (tx) => {
           await credentialLease.assertOwned(tx);
+          await notifyChatActionWork(tx, "slash_task_start");
           await tx
             .update(chatActions)
             .set({
@@ -30730,6 +30722,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               },
             );
           }
+          await notifyChatActionWork(tx, "slash_task_start");
           const rows = await tx
             .update(chatActions)
             .set({
@@ -30791,6 +30784,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         }
         const [completed] = await db.transaction(async (tx) => {
           await credentialLease.assertOwned(tx);
+          await notifyChatActionWork(tx, "slash_task_start");
           return tx
             .update(chatActions)
             .set({
@@ -35221,6 +35215,18 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     return null;
   }
 
+  async function progressSupersededByFastResponse(publication: typeof chatPublications.$inferSelect): Promise<boolean> {
+    if (!["queued", "working"].includes(publication.payload.progressState ?? "")) return false;
+    const runId = runIdFromMilestonePublication(publication);
+    const [run] = runId ? await db.select({ context: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, publication.companyId), eq(heartbeatRuns.id, runId))) : [];
+    const sourceCommentId = typeof run?.context?.wakeCommentId === "string" ? run.context.wakeCommentId : typeof run?.context?.commentId === "string" ? run.context.commentId : publication.commentId;
+    if (!sourceCommentId) return false;
+    const [receipt] = await db.select({ id: fastResponseRequests.id }).from(fastResponseRequests).innerJoin(chatPublications,
+      and(eq(chatPublications.companyId, publication.companyId), eq(chatPublications.commentId, fastResponseRequests.commentId), eq(chatPublications.state, "published")))
+      .where(and(eq(fastResponseRequests.companyId, publication.companyId), eq(fastResponseRequests.sourceCommentId, sourceCommentId), eq(fastResponseRequests.endpointId, publication.endpointId), eq(fastResponseRequests.conversationId, publication.conversationId))).limit(1);
+    return Boolean(receipt);
+  }
+
   async function runProgressSupersededByPublishedInteraction(
     publication: typeof chatPublications.$inferSelect,
   ): Promise<boolean> {
@@ -36959,43 +36965,36 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
   ) {
     const now = new Date();
     const actions = await db
-      .select()
+      .select({ action: chatActions })
       .from(chatActions)
-      .where(
-        and(
-          eq(chatActions.kind, "slack_session_sync"),
-          ...(onlyActionId ? [eq(chatActions.id, onlyActionId)] : []),
-          or(
-            and(
-              eq(chatActions.status, "received"),
-              sql`(${chatActions.result}->>'retryAt' is null or (${chatActions.result}->>'retryAt')::timestamptz <= ${now.toISOString()}::timestamptz)`,
-            ),
-            and(
-              eq(chatActions.status, "processing"),
-              lte(chatActions.updatedAt, new Date(now.getTime() - 60_000)),
-            ),
-          ),
-        ),
-      )
+      .leftJoin(chatEndpoints, and(eq(chatEndpoints.id, chatActions.endpointId), eq(chatEndpoints.companyId, chatActions.companyId)))
+      .where(and(
+        onlyActionId ? eq(chatActions.id, onlyActionId) : undefined,
+        dueChatAction("slack_session_sync", now.getTime()),
+      ))
       .orderBy(asc(chatActions.updatedAt))
-      .limit(limit);
+      .limit(limit)
+      .then(rows => rows.map(row => row.action));
     await options.slackSessionSyncSelectionBarrier?.();
     for (const action of actions) {
       const payload = slackSessionSyncPayload(action.payload);
       if (!payload || !action.conversationId) {
-        await db
-          .update(chatActions)
-          .set({
-            status: "failed",
-            result: { code: "slack_session_payload_invalid" },
-            updatedAt: new Date(),
-          })
-          .where(
-            and(
-              eq(chatActions.id, action.id),
-              eq(chatActions.updatedAt, action.updatedAt),
-            ),
-          );
+        await db.transaction(async (tx) => {
+          await notifyChatActionWork(tx, "slack_session_sync");
+          return tx
+            .update(chatActions)
+            .set({
+              status: "failed",
+              result: { code: "slack_session_payload_invalid" },
+              updatedAt: new Date(),
+            })
+            .where(
+              and(
+                eq(chatActions.id, action.id),
+                eq(chatActions.updatedAt, action.updatedAt),
+              ),
+            );
+        });
         continue;
       }
       const revisionWhere = and(
@@ -37008,26 +37007,19 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         eq(chatActions.updatedAt, action.updatedAt),
       );
       const record = await endpointRecord(action.endpointId);
-      if (record && ["paused", "attention"].includes(record.endpoint.status)) {
-        await db
-          .update(chatActions)
-          .set({
-            status: "received",
-            result: { retryAt: new Date(Date.now() + 30_000).toISOString() },
-            updatedAt: new Date(),
-          })
-          .where(selectedSnapshotWhere);
-        continue;
-      }
+      if (record && ["paused", "attention"].includes(record.endpoint.status)) continue;
       if (!record || record.endpoint.provider !== "slack") {
-        await db
-          .update(chatActions)
-          .set({
-            status: "cancelled",
-            result: { code: "slack_session_endpoint_unavailable" },
-            updatedAt: new Date(),
-          })
-          .where(selectedSnapshotWhere);
+        await db.transaction(async (tx) => {
+          await notifyChatActionWork(tx, "slack_session_sync");
+          return tx
+            .update(chatActions)
+            .set({
+              status: "cancelled",
+              result: { code: "slack_session_endpoint_unavailable" },
+              updatedAt: new Date(),
+            })
+            .where(selectedSnapshotWhere);
+        });
         continue;
       }
       const attempts =
@@ -37112,6 +37104,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                 ? endpoint.allowDirectMessages
                 : nonDirectDestinationAllowed(endpoint, resource))
             ) {
+              await notifyChatActionWork(tx, "slack_session_sync");
               await tx
                 .update(chatActions)
                 .set({
@@ -37146,6 +37139,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               .limit(1)
               .then((rows) => rows[0] ?? null);
             if (!publication) {
+              await notifyChatActionWork(tx, "slack_session_sync");
               await tx
                 .update(chatActions)
                 .set({
@@ -37178,6 +37172,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               if (!run || !["queued", "running"].includes(run.status))
                 status = "active";
             }
+            await notifyChatActionWork(tx, "slack_session_sync");
             const claimed = await tx
               .update(chatActions)
               .set({
@@ -37223,6 +37218,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               outcome === "updated" && claim.status === "processing"
                 ? 30 * 60_000
                 : null;
+            await notifyChatActionWork(tx, "slack_session_sync");
             await tx
               .update(chatActions)
               .set({
@@ -37260,35 +37256,38 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           disposition.kind === "retry"
             ? disposition.retryAfterMs
             : Math.min(5 * 60_000, 1_000 * 2 ** Math.min(attempts, 8));
-        await db
-          .update(chatActions)
-          .set({
-            status: retryable ? "received" : "failed",
-            result: {
-              attempts,
-              code: retryable
-                ? "slack_session_sync_retry"
-                : "slack_session_sync_rejected",
-              ...(retryable
-                ? { retryAt: new Date(Date.now() + retryMs).toISOString() }
-                : {}),
-            },
-            updatedAt: new Date(),
-          })
-          .where(
-            and(
-              revisionWhere,
-              ownsAttempt
-                ? and(
-                    eq(chatActions.status, "processing"),
-                    sql`${chatActions.result}->>'ownerToken' = ${ownerToken}`,
-                  )
-                : and(
-                    eq(chatActions.status, "received"),
-                    eq(chatActions.updatedAt, action.updatedAt),
-                  ),
-            ),
-          );
+        await db.transaction(async (tx) => {
+          await notifyChatActionWork(tx, "slack_session_sync");
+          return tx
+            .update(chatActions)
+            .set({
+              status: retryable ? "received" : "failed",
+              result: {
+                attempts,
+                code: retryable
+                  ? "slack_session_sync_retry"
+                  : "slack_session_sync_rejected",
+                ...(retryable
+                  ? { retryAt: new Date(Date.now() + retryMs).toISOString() }
+                  : {}),
+              },
+              updatedAt: new Date(),
+            })
+            .where(
+              and(
+                revisionWhere,
+                ownsAttempt
+                  ? and(
+                      eq(chatActions.status, "processing"),
+                      sql`${chatActions.result}->>'ownerToken' = ${ownerToken}`,
+                    )
+                  : and(
+                      eq(chatActions.status, "received"),
+                      eq(chatActions.updatedAt, action.updatedAt),
+                    ),
+              ),
+            );
+        });
         logger.warn(
           {
             endpointId: action.endpointId,
@@ -37796,6 +37795,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         // because it now occupies the next FIFO slot.
         const progressSupersessionReason =
           (await runOwnershipMilestoneSupersessionReason(publication)) ??
+          ((await progressSupersededByFastResponse(publication)) ? "Acknowledged by contextual fast response" : null) ??
           ((await runProgressSupersededByPublishedInteraction(publication))
             ? "Run progress was superseded by its provider interaction"
             : null);
@@ -39064,6 +39064,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
 
   return {
     voice,
+    authorizeFastResponse,
     slackRegistration,
     saveGitHubSetupProgress: async (endpointId: string, stage: NonNullable<ChatEndpointSetupState["github"]>["stage"]) => {
       const record = await endpointRecord(endpointId);
@@ -39116,6 +39117,11 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     processQueuedDeliveries: () => processPendingDeliveries(25, undefined, false),
     scheduleQueuedPublications: () => processPendingPublications(25, { waitForCompletion: false, maintenance: false }),
     processPendingChatMaintenance,
+    processPendingSlackBoardMessages,
+    processPendingSlackTaskStarts,
+    processPendingVerificationMessages: slackRegistration.processPendingVerificationMessages,
+    nextVerificationMessageAt: slackRegistration.nextVerificationMessageAt,
+    nextChatActionAt: (kind: ScheduledChatAction) => nextChatActionAt(db, kind),
     processPublicationMaintenance,
     nextInboundDeliveryAt,
     nextPublicationAt,

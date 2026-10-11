@@ -1,3 +1,5 @@
+import { nativeChatWorkspaceCwd } from "./native-runtime/native-chat-workspace.js";
+import { selectHeartbeatEnvironment } from "./heartbeat/environment-selection.js";
 import { prepareHeartbeatWorkspace } from "./heartbeat/workspace-preparation.js";
 import { executeHeartbeatRuntime, NativeSessionResumeScheduledError, NativeWorkspaceFinalizeScheduledError } from "./heartbeat/runtime-execution.js";
 import { selectHeartbeatRuntime } from "./heartbeat/runtime-selection.js";
@@ -13,7 +15,7 @@ import {
   formatIssueIdentifierLink,
 } from "./heartbeat/scheduling.js";
 import { canApplyTaskWorkspaceSelectionAtAdmission, taskWorkspaceRuntimeSelectionEnabled } from "./execution-workspace-policy.js";
-import { assertTaskWorkspaceAccess, assertTaskWorkspaceSourceProjectAccess } from "./task-workspace-source-access.js";
+import { FAST_RESPONSE_AGENT_GUIDANCE, fastResponseHistoryBody } from "@paperclipai/shared";
 import { agentExecutionsHaveStopped } from "./agent-execution-stop.js";
 import {
   cancelHeartbeatNativeRun,
@@ -56,7 +58,6 @@ import {
 } from "./heartbeat/recovery.js";
 import {
   BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS,
-  WorkspaceBusyDeferral,
   isWorkspaceBusyDeferral,
   createHeartbeatRetries,
 } from "./heartbeat/retries.js";
@@ -139,8 +140,6 @@ export {
   buildPaperclipWakePayload,
 } from "./heartbeat/run-preparation.js";
 import {
-  resolveNativeRecoveryExecutionWorkspaceBinding,
-  resolveExecutionWorkspaceReuseRequestForIssue,
   buildExecutionWorkspaceConfigSnapshot,
   stripWorkspaceRuntimeFromExecutionRunConfig,
   buildEffectiveRunSessionConfigMetadata,
@@ -335,7 +334,6 @@ import {
   inArray,
   isNull,
   notInArray,
-  ne,
   or,
   sql,
 } from "drizzle-orm";
@@ -423,12 +421,6 @@ import {
   isNativeRunnerOwnershipHeld,
   NATIVE_OWNERSHIP_UNVERIFIED_ERROR_CODE,
 } from "./native-runtime/native-runner-ownership.js";
-import {
-  findNativeChatWorkspaceScope,
-  nativeChatWorkspaceCwd,
-  nativeChatWorkspaceMatches,
-} from "./native-runtime/native-chat-workspace.js";
-import { shouldUseIsolatedTaskDirectory } from "./isolated-task-directory.js";
 import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import {
@@ -508,19 +500,13 @@ import {
   gateProjectExecutionWorkspacePolicy,
   parseIssueExecutionWorkspaceSettings,
   parseProjectExecutionWorkspacePolicy,
-  resolveEffectiveWorkspaceStrategyType,
-  resolveExecutionWorkspaceEnvironmentId,
   resolveExecutionWorkspaceMode,
-  resolveSharedWorkspaceConcurrency,
   selectEnvironmentExecutionWorkspaceSettings,
 } from "./execution-workspace-policy.js";
 import {
   instanceSettingsService,
   resolveWorktreeRunExecutionActivation,
 } from "./instance-settings.js";
-import {
-  isExecutionForcedToKubernetes,
-} from "./execution-allowlist.js";
 
 import {
   buildConfigurationIncompleteRecoveryNoticeSeed,
@@ -575,7 +561,6 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 
 import { environmentService } from "./environments.js";
-import { parseExecutionPolicyBootstrapEnv } from "./execution-policy-bootstrap.js";
 
 import {
   environmentRuntimeService,
@@ -2814,7 +2799,7 @@ export function heartbeatService(
             ? [
                 {
                   id: comment.id,
-                  body: comment.body,
+                  body: fastResponseHistoryBody({ body: comment.body, origin: typeof comment.origin === "string" ? comment.origin : null }),
                   attachments: Array.isArray(comment.attachments)
                     ? comment.attachments.flatMap((attachment) => {
                         const descriptor = parseObject(attachment);
@@ -2979,6 +2964,7 @@ export function heartbeatService(
       } else {
         delete context.paperclipTaskMarkdownAssignmentCompact;
       }
+      context.paperclipTaskCommunicationGuidance = [context.paperclipTaskCommunicationGuidance, FAST_RESPONSE_AGENT_GUIDANCE].filter(Boolean).join("\n\n");
       if (issueRef) {
         const redactedWakeContext = await createRunSecretRedactionRegistry(
           db,
@@ -3042,48 +3028,6 @@ export function heartbeatService(
       } else {
         delete context.paperclipTurnContext;
       }
-      // A native run's execution input is immutable once persisted. Recovery must therefore
-      // restore the workspace bound to that input rather than consulting the issue's current
-      // workspace pointer: a newer run may already have moved or cleared the issue binding while
-      // this older provider session is still recoverable.
-      const persistedRunnerProfile = parseObject(run.runnerProfileJson);
-      const persistedNativeExecutionInput =
-        run.runtimeMode === "native" &&
-        persistedRunnerProfile.nativeExecutionInput !== undefined
-          ? parseNativeExecutionInput(
-              persistedRunnerProfile.nativeExecutionInput,
-            )
-          : null;
-      const isDotRun = persistedNativeExecutionInput?.provider.kind === "openai_dot"
-        || (!persistedNativeExecutionInput && agent.adapterType === "paperclip_runner" && parseObject(agent.adapterConfig).provider === "openai_dot");
-      const persistedNativeExecutionWorkspaceId =
-        persistedNativeExecutionInput?.binding.executionWorkspaceId ?? null;
-      const requestedExecutionWorkspaceId =
-        persistedNativeExecutionWorkspaceId ??
-        readNonEmptyString(issueRef?.executionWorkspaceId);
-      const existingExecutionWorkspace = requestedExecutionWorkspaceId
-        ? await executionWorkspacesSvc.getById(requestedExecutionWorkspaceId)
-        : null;
-      const nativeRecoveryExecutionWorkspaceId =
-        resolveNativeRecoveryExecutionWorkspaceBinding({
-          bindingId: persistedNativeExecutionWorkspaceId,
-          persistedWorkspaceFound: existingExecutionWorkspace !== null,
-        });
-      const workspaceReuseRequest =
-        resolveExecutionWorkspaceReuseRequestForIssue({
-          issueExecutionWorkspaceId: requestedExecutionWorkspaceId,
-          issueExecutionWorkspacePreference: nativeRecoveryExecutionWorkspaceId
-            ? "reuse_existing"
-            : (issueRef?.executionWorkspacePreference ?? null),
-          existingExecutionWorkspaceStatus:
-            existingExecutionWorkspace?.status ?? null,
-        });
-      const requestedShouldReuseExisting =
-        workspaceReuseRequest.requestedShouldReuseExisting;
-      const reusableExistingExecutionWorkspace =
-        workspaceReuseRequest.existingExecutionWorkspaceAvailable
-          ? existingExecutionWorkspace
-          : null;
       const sourceWorkspaceConfig = buildExecutionWorkspaceAdapterConfig({
         agentConfig: config,
         projectPolicy: projectExecutionWorkspacePolicy,
@@ -3096,312 +3040,40 @@ export function heartbeatService(
           ...(requestedAiBinding?.mode === "router" ? parseObject(parseObject(context.aiRouterSelection).runtimeConfig) : {}),
         },
       });
-      const workspaceAuthorizationActor = { type: "agent" as const, agentId: agent.id, companyId: agent.companyId,
-        source: "agent_jwt" as const, runId: run.id, onBehalfOfUserId: responsibleUserId === "local-board" ? null : responsibleUserId };
-      if (!persistedNativeExecutionInput && !nativeRecoveryExecutionWorkspaceId) {
-        const workspaceRequiringAccess = reusableExistingExecutionWorkspace ?? boundSourceWorkspace;
-        if (workspaceRequiringAccess) {
-          await assertTaskWorkspaceAccess(db, workspaceAuthorizationActor, agent.companyId, workspaceRequiringAccess.id, { write: true, issueId });
-        } else if (!isDotRun && executionProjectId && (selectedWorkspaceSource || workspaceProjectContext?.hasWorkspace)) {
-          // Check source authority before resolution can clone or expose files.
-          await assertTaskWorkspaceSourceProjectAccess(db, workspaceAuthorizationActor, agent.companyId, executionProjectId, { write: resolveEffectiveWorkspaceStrategyType(requestedExecutionWorkspaceMode, sourceWorkspaceConfig) !== "git_worktree", issueId });
-        }
-      }
-      const requestedReusableExecutionWorkspaceConfig =
-        reusableExistingExecutionWorkspace?.config ?? null;
-      const localEnvironment = await environmentsSvc.ensureLocalEnvironment(
-        agent.companyId,
-      );
-      const resolvedInstanceSettings = await instanceSettings.get();
-      // Managed-sandbox-only policy: a run that would land on the local
-      // environment is redirected onto the platform-managed sandbox row, and
-      // with no active managed row the resolution fails closed
-      // (ManagedSandboxUnavailableError) — never local. Mirrors the forced
-      // kubernetes execution mode below, which takes precedence when both
-      // regimes are active.
-      const managedSandboxOnly =
-        (await instanceSettings.getExperimental()).enableManagedSandboxOnly ===
-        true;
-      const managedSandboxEnvironment = managedSandboxOnly
-        ? await environmentsSvc.findManagedSandboxEnvironment(agent.companyId)
-        : null;
-      const environmentResolution = resolveExecutionWorkspaceEnvironmentId({
-        lowTrustIssueEnvironmentId: trustPreset.kind === "low_trust_review"
-          ? parseIssueExecutionWorkspaceSettings(issueContext?.executionWorkspaceSettings, {includeEnvironmentId: true})?.environmentId : null,
-        agentDefaultEnvironmentId: agent.defaultEnvironmentId,
-        instanceDefaultEnvironmentId:
-          resolvedInstanceSettings.defaultEnvironmentId ?? null,
-        localDefaultEnvironmentId: localEnvironment.id,
-        managedSandboxOnly,
-        managedSandboxEnvironmentId: managedSandboxEnvironment?.id ?? null,
+      const {
+        persistedRunnerProfile,
+        persistedNativeExecutionInput,
+        isDotRun,
+        existingExecutionWorkspace,
+        nativeRecoveryExecutionWorkspaceId,
+        workspaceReuseRequest,
+        requestedShouldReuseExisting,
+        reusableExistingExecutionWorkspace,
+        requestedReusableExecutionWorkspaceConfig,
+        localEnvironment,
+        resolvedInstanceSettings,
+        environmentResolution,
+        effectiveExecutionWorkspaceMode,
+        executionPolicy,
+        selectedEnvironmentId,
+        selectedEnvironmentForConfig,
+        nativeChatWorkspaceScope,
+        nativeChatExpectedCwd: selectedNativeChatExpectedCwd,
+        materializeNativeChatWorktree,
+        explicitTaskDirectory,
+        useIsolatedTaskDirectory,
+      } = await selectHeartbeatEnvironment(db, {
+        run, agent,
+        task: { issueRef, issueContext, issueId, context, executionProjectId, workspaceProjectContext, boundSourceWorkspace,
+          hasSelectedWorkspaceSource: Boolean(selectedWorkspaceSource), taskWorkspaceIntent: taskWorkspaceIntentRow?.intent ?? null, responsibleUserId },
+        policy: {
+          trustPreset, requestedExecutionWorkspaceMode, isolatedWorkspacesEnabled: runtimeWorkspaceSelectionEnabled,
+          projectExecutionWorkspacePolicy, issueExecutionWorkspaceSettings,
+        },
+        config: { config, sourceWorkspaceConfig, issueAssigneeOverrides },
+        services: { executionWorkspacesSvc, environmentsSvc, instanceSettings, findSharedWorkspaceHolder },
       });
-      const effectiveExecutionWorkspaceMode: ReturnType<
-        typeof resolveExecutionWorkspaceMode
-      > = requestedExecutionWorkspaceMode;
-      const executionPolicy = {
-        executionMode: resolvedInstanceSettings.general.executionMode,
-        // Backstop behind the resolver's local→managed redirect: the run-time
-        // allowlist below fails any run that still resolved to a `local`
-        // environment under managed-sandbox-only, so no selection path or
-        // tenant-set env var can land untrusted execution on the tenant
-        // container.
-        managedSandboxOnly,
-      };
-      const executionForcedToKubernetes =
-        isExecutionForcedToKubernetes(executionPolicy);
-      let selectedEnvironmentId = environmentResolution.environmentId;
-      if (executionForcedToKubernetes) {
-        let kubernetesEnvironment =
-          await environmentsSvc.findKubernetesEnvironment(agent.companyId);
-        if (!kubernetesEnvironment) {
-          // Lazy recovery for companies created after the startup bootstrap ran
-          // (the boot hook only provisions environments for companies that exist
-          // at boot). Re-derive the managed-env config from the bootstrap env.
-          // If the process env no longer forces Kubernetes (rollback / config
-          // drift relative to the persisted executionMode setting), skip the
-          // provisioning gracefully: the guard below still refuses local
-          // fallback with the explicit error, instead of crashing here on
-          // undefined config.
-          let bootstrap: ReturnType<typeof parseExecutionPolicyBootstrapEnv> =
-            null;
-          let bootstrapSkipReason: string | null = null;
-          try {
-            bootstrap = parseExecutionPolicyBootstrapEnv(process.env);
-            if (!bootstrap) {
-              bootstrapSkipReason =
-                'PAPERCLIP_EXECUTION_MODE bootstrap env is not kubernetes-forced (absent or "any")';
-            }
-          } catch (err) {
-            bootstrapSkipReason = `PAPERCLIP_EXECUTION_MODE bootstrap env failed to parse: ${
-              err instanceof Error ? err.message : String(err)
-            }`;
-          }
-          if (bootstrap) {
-            await environmentsSvc.ensureKubernetesEnvironment(
-              agent.companyId,
-              bootstrap.kubernetesConfig,
-            );
-            kubernetesEnvironment =
-              await environmentsSvc.findKubernetesEnvironment(agent.companyId);
-          } else {
-            logger.warn(
-              {
-                runId: run.id,
-                agentId: agent.id,
-                companyId: agent.companyId,
-                reason: bootstrapSkipReason,
-              },
-              "executionMode=kubernetes is persisted but the bootstrap env cannot provision a managed Kubernetes environment; skipping lazy provisioning for this company (the run will fail with the explicit no-managed-environment error)",
-            );
-          }
-        }
-        if (!kubernetesEnvironment) {
-          throw new Error(
-            "Instance execution policy requires the Kubernetes sandbox provider " +
-              "(executionMode=kubernetes) but no managed Kubernetes environment is " +
-              "configured for this company. Configure one (PAPERCLIP_K8S_* env on the " +
-              "cloud instance) before running agents; refusing to fall back to local execution.",
-          );
-        }
-        if (kubernetesEnvironment.id !== selectedEnvironmentId) {
-          logger.info(
-            {
-              runId: run.id,
-              issueId,
-              agentId: agent.id,
-              resolvedEnvironmentId: selectedEnvironmentId,
-              forcedKubernetesEnvironmentId: kubernetesEnvironment.id,
-            },
-            "Forcing run onto the managed Kubernetes environment (executionMode=kubernetes)",
-          );
-        }
-        selectedEnvironmentId = kubernetesEnvironment.id;
-      }
-      const selectedEnvironmentForConfig =
-        selectedEnvironmentId === localEnvironment.id
-          ? localEnvironment
-          : selectedEnvironmentId
-            ? await environmentsSvc.getById(selectedEnvironmentId)
-            : null;
-      const nativeChatWorkspaceScope = await findNativeChatWorkspaceScope(db, {
-        adapterType: agent.adapterType,
-        environmentDriver: selectedEnvironmentForConfig?.driver ?? null,
-        companyId: agent.companyId,
-        agentId: agent.id,
-        issueId,
-        admittedCwd: persistedNativeExecutionInput && persistedNativeExecutionInput.schema !== "paperclip.native-execution-input.v6"
-          ? persistedNativeExecutionInput.workspace.cwd : null,
-      });
-      let nativeChatExpectedCwd = nativeChatWorkspaceScope
-        ? nativeChatWorkspaceCwd(
-            nativeChatWorkspaceScope,
-            reusableExistingExecutionWorkspace,
-            requestedShouldReuseExisting,
-          )
-        : null;
-      if (
-        nativeChatWorkspaceScope &&
-        persistedNativeExecutionInput &&
-        persistedNativeExecutionInput.schema !== "paperclip.native-execution-input.v6" &&
-        !nativeChatWorkspaceMatches({
-          scope: nativeChatWorkspaceScope,
-          expectedCwd: nativeChatExpectedCwd,
-          execution: persistedNativeExecutionInput,
-        })
-      ) {
-        // Never rewrite an admitted provider input or release ownership of an
-        // older process whose permissions still include the shared agent home.
-        throw new NativeRunnerOwnershipUnverifiedError(
-          "native_chat_workspace_scope_mismatch",
-        );
-      }
-      const materializeNativeChatWorktree = Boolean(
-        nativeChatWorkspaceScope?.projectId && !persistedNativeExecutionInput && !existingExecutionWorkspace &&
-        taskWorkspaceIntentRow?.intent?.selection.kind === "configured_source" &&
-        taskWorkspaceIntentRow.intent.selection.mode === "managed_isolated" &&
-        requestedExecutionWorkspaceMode === "isolated_workspace" &&
-        resolveEffectiveWorkspaceStrategyType(requestedExecutionWorkspaceMode, sourceWorkspaceConfig) === "git_worktree",
-      );
-      if (
-        nativeChatWorkspaceScope &&
-        ((!nativeChatExpectedCwd && !materializeNativeChatWorktree) ||
-          executionProjectId !== nativeChatWorkspaceScope.projectId)
-      ) {
-        throw new ConfigurationIncompleteFailure(
-          "External chat requires a task-owned isolated workspace. Select a managed isolated source or an existing task-owned isolated worktree; shared project workspaces cannot be used for external chat.",
-          {
-            configurationIncomplete: {
-              reason: "native_chat_workspace_isolation_required",
-              issueId,
-            },
-          },
-        );
-      }
-      if (!nativeRecoveryExecutionWorkspaceId && reusableExistingExecutionWorkspace &&
-          effectiveExecutionWorkspaceMode === "shared_workspace" &&
-          selectedEnvironmentForConfig?.driver !== "local" && selectedEnvironmentForConfig?.driver !== "ssh") {
-        const [remoteSharedHolder] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
-          eq(heartbeatRuns.companyId, agent.companyId), ne(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "running"),
-          sql`exists (select 1 from ${issues} where ${issues.companyId} = ${agent.companyId}
-            and ${issues.executionWorkspaceId} = ${reusableExistingExecutionWorkspace.id}
-            and (${issues.executionRunId} = ${heartbeatRuns.id} or ${issues.id}::text = coalesce(${heartbeatRuns.contextSnapshot}->>'issueId', ${heartbeatRuns.contextSnapshot}->>'taskId')))`,
-        )).limit(1);
-        if (remoteSharedHolder) throw new ConfigurationIncompleteFailure("This environment cannot place concurrent agents in one physical shared folder. Use local/SSH sharing or isolated task workspaces.", {
-          configurationIncomplete: { reason: "shared_realization_unsupported", issueId },
-        });
-      }
-      const sharedWorkspaceConcurrency = resolveSharedWorkspaceConcurrency({
-        projectPolicy: projectExecutionWorkspacePolicy,
-        issueSettings: issueExecutionWorkspaceSettings,
-      });
-      // A live holder is always consulted for shared workspaces. Depending on policy and the final
-      // execution target it either remains the existing deferral gate or becomes dispatch context.
-      // Local/SSH folders never take an exclusive workspace lock, including when older
-      // project or issue settings request serialization. Sandbox protection still uses
-      // the existing holder staleness and workspace_busy retry ladder.
-      if (
-        issueRef?.projectWorkspaceId &&
-        effectiveExecutionWorkspaceMode === "shared_workspace"
-      ) {
-        const workspaceHolder = await findSharedWorkspaceHolder({
-          companyId: agent.companyId,
-          projectWorkspaceId: issueRef.projectWorkspaceId,
-          excludeIssueId: issueRef.id,
-          excludeRunId: run.id,
-          honorIsolatedWorkspaceModes: runtimeWorkspaceSelectionEnabled,
-        });
-        if (workspaceHolder) {
-          const environmentDriver =
-            selectedEnvironmentForConfig?.driver ?? null;
-          if (!nativeRecoveryExecutionWorkspaceId && sharedWorkspaceConcurrency === "allow" &&
-              (executionForcedToKubernetes || (environmentDriver !== "local" && environmentDriver !== "ssh"))) {
-            throw new ConfigurationIncompleteFailure("This environment cannot place concurrent agents in one physical shared folder. Use local/SSH sharing or isolated task workspaces.", {
-              configurationIncomplete: { reason: "shared_realization_unsupported", issueId },
-            });
-          }
-          const shouldSerialize =
-            sharedWorkspaceConcurrency !== "allow" &&
-            (executionForcedToKubernetes ||
-              (environmentDriver !== "local" &&
-                environmentDriver !== "ssh"));
-          if (shouldSerialize) {
-            throw new WorkspaceBusyDeferral({
-              holder: workspaceHolder,
-              projectWorkspaceId: issueRef.projectWorkspaceId,
-              deferralAttempt:
-                run.scheduledRetryReason === WORKSPACE_BUSY_RETRY_REASON
-                  ? (run.scheduledRetryAttempt ?? 0)
-                  : 0,
-              wasIssueAssignee: issueContext?.assigneeAgentId === agent.id,
-            });
-          }
-
-          const holderIssueLabel =
-            workspaceHolder.issueIdentifier ?? workspaceHolder.issueId;
-          const concurrentWorkspaceNote =
-            `shared workspace is concurrently held by run ${workspaceHolder.runId} (issue ${holderIssueLabel}); ` +
-            "expect concurrent mutations, coordinate via commits";
-          const appendConcurrentWorkspaceNote = (value: unknown) => {
-            const existing = typeof value === "string" ? value.trimEnd() : "";
-            return existing
-              ? `${existing}\n${concurrentWorkspaceNote}`
-              : concurrentWorkspaceNote;
-          };
-          context.paperclipTaskMarkdown = appendConcurrentWorkspaceNote(
-            context.paperclipTaskMarkdown,
-          );
-          context.paperclipTaskMarkdownAssignment = appendConcurrentWorkspaceNote(
-            context.paperclipTaskMarkdownAssignment,
-          );
-          if (typeof context.paperclipTaskMarkdownCompact === "string") {
-            context.paperclipTaskMarkdownCompact =
-              appendConcurrentWorkspaceNote(
-                context.paperclipTaskMarkdownCompact,
-              );
-          }
-          if (typeof context.paperclipTaskMarkdownAssignmentCompact === "string") {
-            context.paperclipTaskMarkdownAssignmentCompact =
-              appendConcurrentWorkspaceNote(
-                context.paperclipTaskMarkdownAssignmentCompact,
-              );
-          }
-          logger.info(
-            {
-              event: "shared_workspace_concurrent_dispatch",
-              runId: run.id,
-              issueId: issueRef.id,
-              projectWorkspaceId: issueRef.projectWorkspaceId,
-              holderRunId: workspaceHolder.runId,
-              holderIssueId: workspaceHolder.issueId,
-              sharedWorkspaceConcurrency,
-              environmentDriver,
-              executionForcedToKubernetes,
-            },
-            "Dispatching alongside a live shared-workspace holder",
-          );
-        }
-      }
-      // Once bound, retained workspace authorization above is authoritative.
-      // The original source selection may outlive its configuration row.
-      if (taskWorkspaceIntentRow?.intent && !boundSourceWorkspace && !nativeRecoveryExecutionWorkspaceId) {
-        await executionWorkspacesSvc.validateSelection({ companyId: agent.companyId,
-          actor: { type: "agent", agentId: agent.id, companyId: agent.companyId, runId: run.id, source: "agent_jwt", onBehalfOfUserId: responsibleUserId === "local-board" ? null : responsibleUserId },
-          selection: taskWorkspaceIntentRow.intent.selection, issueId });
-      }
-      const explicitTaskDirectory = taskWorkspaceIntentRow?.intent?.selection.kind === "task_directory";
-      const useIsolatedTaskDirectory = issueRef !== null && shouldUseIsolatedTaskDirectory({
-        trustPreset: trustPreset.kind,
-        environmentDriver: selectedEnvironmentForConfig?.driver ?? null,
-        mode: requestedExecutionWorkspaceMode,
-        hasProjectWorkspace: workspaceProjectContext?.hasWorkspace ?? false,
-        projectWorkspaceId: issueRef.projectWorkspaceId,
-        workspaceStrategies: [
-          config.workspaceStrategy,
-          issueAssigneeOverrides?.adapterConfig?.workspaceStrategy,
-          projectExecutionWorkspacePolicy?.workspaceStrategy,
-          issueExecutionWorkspaceSettings?.workspaceStrategy,
-        ],
-      });
+      let nativeChatExpectedCwd = selectedNativeChatExpectedCwd;
       const mergedConfig = {
         ...sourceWorkspaceConfig,
         // The base below is already task-owned. Keep directory transport while

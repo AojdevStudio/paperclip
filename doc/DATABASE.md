@@ -433,6 +433,14 @@ run/turn ids, payload digest, attempt/acknowledgement state, and one of `steered
 `issue_thread_interactions.result`. Deleting the interaction cascades its receipt,
 while deleting a referenced run clears that run pointer without deleting history.
 
+The question-history index covers `(company_id, idempotency_key)` for every
+`question-response:` wake state, including failed, cancelled, and skipped
+receipts excluded from the delivery-idempotency fence. Migration `0332` creates
+this nonunique index concurrently through the standard migration executor.
+Apply it with `pnpm db:migrate` on a direct connection before enabling the new
+sleep guard. The executor retries interrupted invalid builds and records history
+only after the index is valid. It does not delete delivery or wake records.
+
 ## Plugin database namespaces
 
 The plugin runtime tracks plugin-owned database namespaces and migrations in `plugin_database_namespaces` and `plugin_migrations`. Hosted deployments that separate runtime and migration connections should set `DATABASE_MIGRATION_URL`; plugin namespace migration work uses the migration connection when present.
@@ -739,7 +747,7 @@ transaction boundary.
 
 ### Task workspace records (2026-10-09)
 
-Migration [0331_harsh_newton_destine.sql](../packages/db/src/migrations/0331_harsh_newton_destine.sql) makes `execution_workspaces.project_id` nullable and changes its project reference to `ON DELETE RESTRICT`: source-project policy cannot disappear while a workspace still depends on it. `issues.execution_workspace_id` remains the sole active task binding. Versioned selection/pending-selection JSON and a binding revision record intent and protect transitions; they are not additional active bindings.
+Migration [0333_pretty_infant_terrible.sql](../packages/db/src/migrations/0333_pretty_infant_terrible.sql) makes `execution_workspaces.project_id` nullable and changes its project reference to `ON DELETE RESTRICT`: source-project policy cannot disappear while a workspace still depends on it. `issues.execution_workspace_id` remains the sole active task binding. Versioned selection/pending-selection JSON and a binding revision record intent and protect transitions; they are not additional active bindings.
 
 `execution_workspace_repositories` is company-scoped inventory beneath an execution workspace. It records repository identity, contained relative path, requested ref, pinned commit, preparation state and idempotency receipts. Credentials are resolved at use and are never stored in this inventory. Connection/destination `execution_defaults` JSON contains optional typed project/workspace choices, never arbitrary host paths or commands.
 
