@@ -1,3 +1,4 @@
+import { idleWorkSnapshot } from "../services/task-admission.js";
 import { registerChatActionWork, dueChatAction } from "../services/chat-action-work.js";
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
 import { registerChatDeliveryWork } from "../services/chat-delivery-work.js";
@@ -60375,7 +60376,10 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
               await context.service.prepareFailedChatRunRetry(tx, input);
               throw new Error("rollback retry intent");
             })).rejects.toThrow("rollback retry intent");
-            await vi.waitFor(() => expect(coordinator.nextWakeAt()).toBeNull());
+            await vi.waitFor(() => {
+              expect(coordinator.nextWakeAt()).toBeNull();
+              expect(idleWorkSnapshot().active).toBe(0);
+            }, { timeout: 10_000 });
             expect(context.wakeup).not.toHaveBeenCalled();
           }
           if (mode === "retry") {
@@ -60407,7 +60411,12 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         expect(receipts).toHaveLength(1);
         expect(receipts[0]?.payload).toMatchObject({ retryOfRunId: context.runId,
           wakeCommentIds: [context.action.payload.commentId] });
-        // With all registered queues drained, an idle second must issue no SQL.
+        // A running worker has no scheduled deadline. Wait for its final scan
+        // and any commit-driven follow-up before measuring the quiet period.
+        await vi.waitFor(() => {
+          expect(coordinator.nextWakeAt()).toBeNull();
+          expect(idleWorkSnapshot().active).toBe(0);
+        }, { timeout: 10_000 });
         const scans = vi.spyOn(db, "select");
         try {
           await new Promise(resolve => setTimeout(resolve, 1200));
