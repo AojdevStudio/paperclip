@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { RUNNER_VENDOR_BUILD_COMMAND } from "../../scripts/prepare-runner-vendor.mjs";
 
 const packageJsonPath = fileURLToPath(
   new URL("../../package.json", import.meta.url),
@@ -57,12 +58,31 @@ describe("server package build script", () => {
     expect(packageJson.devDependencies?.["@paperclipai/paperclip-runner"]).toBe(
       "workspace:*",
     );
+    // prepare-runner-vendor.mjs reuses a Runner build whose recorded inputs
+    // are unchanged (the `pnpm -r build` case) and otherwise runs the Runner's
+    // full build, which is what a standalone server build (the Dockerfile's
+    // path) relies on. Pin both the indirection and the command behind it.
     expect(packageJson.scripts?.["prepare:runner-vendor"]).toBe(
+      "node scripts/prepare-runner-vendor.mjs",
+    );
+    expect(RUNNER_VENDOR_BUILD_COMMAND).toBe(
       "pnpm --filter @paperclipai/paperclip-runner build",
     );
+    expect(packageJson.scripts?.build.startsWith("pnpm run prepare:runner-vendor && ")).toBe(true);
     expect(packageJson.scripts?.build).toContain(
       "cp -Rf ../packages/paperclip-runner/dist/. dist/vendor/paperclip-runner/",
     );
+  });
+
+  it("records the Runner's build inputs as the last step of its build", () => {
+    // The stamp prepare-runner-vendor.mjs trusts must only exist for a build
+    // that completed every step and check, so it has to be written last.
+    const runner = JSON.parse(readFileSync(new URL(
+      "../../../packages/paperclip-runner/package.json", import.meta.url,
+    ), "utf8")) as { scripts: Record<string, string> };
+    const steps = runner.scripts.build.split(" && ");
+    expect(steps.at(-1)).toBe("node scripts/record-build-inputs.mjs");
+    expect(steps.filter((step) => step.includes("record-build-inputs"))).toHaveLength(1);
   });
 
   it("replaces an existing read-only image manifest with the build's copy step", () => {
@@ -104,10 +124,10 @@ describe("server package build script", () => {
   });
 
   it("compiles the vendored Runner's TypeScript surface once per build", () => {
-    // prepare:runner-vendor runs the Runner's full build, and `pnpm -r build`
-    // has already run it once by the time the server builds. Each extra
+    // prepare:runner-vendor runs the Runner's full build whenever its recorded
+    // inputs are stale or missing (every standalone server build). Each extra
     // build:typescript inside that chain (two tsc projects plus the eval-kernel
-    // rebuild) costs about 7s on the CI Build job's critical path, twice.
+    // rebuild) costs about 7s on the CI Build job's critical path.
     // Checks that read dist/ must call their script directly, the way
     // generate-replay-goldens.mjs already does, not through a `check:*`
     // wrapper that rebuilds first for standalone use.

@@ -40,7 +40,7 @@
     "postpack": "rm -rf ui-dist",
     "clean": "rm -rf dist",
     "start": "node dist/index.js",
-    "prepare:runner-vendor": "pnpm --filter @paperclipai/paperclip-runner build",
+    "prepare:runner-vendor": "node scripts/prepare-runner-vendor.mjs",
     "typecheck": "pnpm run prepare:runner-vendor && pnpm --filter @paperclipai/plugin-sdk ensure-build-deps && tsc --noEmit"
   },
   "dependencies": {
