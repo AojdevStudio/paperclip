@@ -130,15 +130,38 @@ export function executionWorkspaceRepositoryService(db: Db) {
     const [existing] = await tx.select().from(executionWorkspaceRepositoryRoots).where(and(
       eq(executionWorkspaceRepositoryRoots.companyId, companyId), eq(executionWorkspaceRepositoryRoots.rootKey, rootKey)));
     if (existing && (existing.canonicalCwd !== canonicalCwd || existing.mode !== mode)) throw forbidden(lowTrustRepositoryMessage);
-    if (existing) return canonicalCwd;
     if (mode === "anonymous_only") {
       // Legacy receipts predate root reservations. Even pending/staging work
       // can publish after admission, so no managed intent in this root is safe.
-      const managed = await tx.select({ cwd: executionWorkspaces.cwd }).from(executionWorkspaceRepositories)
+      const managed = await tx.select({ cwd: executionWorkspaces.cwd, repositoryIdentity: executionWorkspaceRepositories.repositoryIdentity }).from(executionWorkspaceRepositories)
         .innerJoin(executionWorkspaces, eq(executionWorkspaces.id, executionWorkspaceRepositories.executionWorkspaceId))
         .where(and(eq(executionWorkspaceRepositories.companyId, companyId), eq(executionWorkspaces.companyId, companyId),
           isNotNull(executionWorkspaceRepositories.catalogRepositoryId)));
-      for (const peer of managed) {
+      if (managed.length) {
+        const namespace = path.join(canonicalCwd, ".paperclip-repositories");
+        const namespaceEntry = await fs.lstat(namespace).catch((error: NodeJS.ErrnoException) => {
+          if (error.code === "ENOENT") return null;
+          throw error;
+        });
+        if (namespaceEntry) {
+          if (!namespaceEntry.isDirectory() || namespaceEntry.isSymbolicLink() || await fs.realpath(namespace) !== namespace) {
+            throw forbidden(lowTrustRepositoryMessage);
+          }
+          // An unreadable/moved legacy alias cannot disprove published private
+          // bytes in this readable root. Markers are agent-writable, so none can
+          // authorize this collision: choose a fresh root even if these bytes
+          // were acquired anonymously. Check existing reservations too, since
+          // older versions may have admitted this root before fencing it.
+          for (const identity of new Set(managed.map(peer => peer.repositoryIdentity))) {
+            const entry = await fs.lstat(path.join(canonicalCwd, taskRepositoryRelativePath(identity))).catch((error: NodeJS.ErrnoException) => {
+              if (error.code === "ENOENT") return null;
+              throw error;
+            });
+            if (entry) throw forbidden(lowTrustRepositoryMessage);
+          }
+        }
+      }
+      if (!existing) for (const peer of managed) {
         if (peer.cwd && await legacyRepositoryRootMayMatch(peer.cwd, canonicalCwd)) throw forbidden(lowTrustRepositoryMessage);
       }
     }

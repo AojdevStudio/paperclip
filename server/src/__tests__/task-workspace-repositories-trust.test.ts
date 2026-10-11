@@ -1,6 +1,6 @@
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdtemp, mkdir, writeFile, readFile, realpath, rm, symlink } from "node:fs/promises";
 import fs from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -197,6 +197,55 @@ const support = await getEmbeddedPostgresTestSupport();
       if (scenario !== "pending_intent") expect(await readFile(path.join(checkout, "private.txt"), "utf8")).toBe("Private peer bytes");
     },
   );
+
+  it.each([
+    { marker: "valid", reserved: false }, { marker: "malformed", reserved: false }, { marker: "symlink", reserved: false },
+    { marker: "valid", reserved: true }, { marker: "malformed", reserved: true }, { marker: "symlink", reserved: true },
+  ])("rejects readable private publication behind an unreadable alias ($marker marker, reserved=$reserved)", async ({ marker, reserved }) => {
+    const f = await fixture();
+    const receipt = await f.request({ kind: "catalog", id: "private-repo" });
+    // Emulate a pre-fence managed publication and, optionally, a reservation
+    // created by the older unreadable-alias bug.
+    await db.delete(executionWorkspaceRepositoryRoots).where(eq(executionWorkspaceRepositoryRoots.companyId, f.companyId));
+    const checkout = path.join(f.admission.cwd, receipt.repository.relativePath);
+    await mkdir(checkout, { recursive: true });
+    const exec = promisify(execFileCallback);
+    await exec("git", ["init", "--initial-branch=main", checkout]);
+    await writeFile(path.join(checkout, "private.txt"), "Private published bytes must never enter low-trust capture\n");
+    await exec("git", ["-C", checkout, "add", "."]);
+    await exec("git", ["-C", checkout, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-m", "private source"]);
+    const pin = (await exec("git", ["-C", checkout, "rev-parse", "HEAD"])).stdout.trim();
+    const owner = path.join(checkout, ".git", "paperclip-workspace-owner.json");
+    const ownerJson = JSON.stringify({ version: 1, repositoryId: receipt.operationId, pinnedCommit: pin });
+    if (marker === "symlink") {
+      const target = path.join(root, `${f.issueId}-untrusted-owner`);
+      await writeFile(target, ownerJson);
+      await symlink(target, owner);
+    } else await writeFile(owner, marker === "valid" ? ownerJson : "{unverifiable owner");
+    await db.update(executionWorkspaceRepositories).set({ state: "ready", pinnedCommit: pin }).where(eq(executionWorkspaceRepositories.id, receipt.operationId));
+    const aliasParent = path.join(root, `${f.issueId}-unreadable`);
+    await mkdir(aliasParent);
+    const alias = path.join(aliasParent, "workspace");
+    await symlink(f.admission.cwd, alias);
+    await db.update(executionWorkspaces).set({ cwd: alias }).where(eq(executionWorkspaces.id, f.workspace.id));
+    const peer = await lowTrustPeer(f);
+    const canonicalCwd = await realpath(f.admission.cwd);
+    if (reserved) await db.insert(executionWorkspaceRepositoryRoots).values({ companyId: f.companyId, canonicalCwd,
+      rootKey: createHash("sha256").update(canonicalCwd).digest("hex"), mode: "anonymous_only" });
+    const actual = fs.realpath.bind(fs);
+    vi.spyOn(fs, "realpath").mockImplementation(async pathname => {
+      if (String(pathname).startsWith(aliasParent)) throw Object.assign(new Error("Unreadable legacy alias"), { code: "EACCES" });
+      return actual(pathname);
+    });
+    await expect(f.service.prepareForAdmission(peer.admission)).rejects.toThrow(/anonymous public URLs only/);
+    await expect(f.service.request({ companyId: f.companyId, issueId: peer.admission.issueId, actor: peer.actor,
+      request: { repository: { kind: "url", url: "https://github.com/public/unrelated" }, requestKey: randomUUID() } }))
+      .rejects.toThrow(/anonymous public URLs only/);
+    expect(await f.service.list(f.companyId, peer.workspace.id)).toEqual([]);
+    expect(acquisition.materialize).not.toHaveBeenCalled();
+    expect(acquisition.managedAuth).not.toHaveBeenCalled();
+    expect(await readFile(path.join(checkout, "private.txt"), "utf8")).toContain("Private published bytes");
+  });
 
   it.each(["standard", "retained_low_trust", "current_low_trust"] as const)("recovers an exact legacy run-ID binding with %s trust", async trust => {
     const f = await fixture();
