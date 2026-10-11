@@ -8,7 +8,7 @@ import path from "node:path";
 import { constants as fsConstants } from "node:fs";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { and, eq } from "drizzle-orm";
-import { agents, companies, createDb, executionWorkspaces, executionWorkspaceRepositories, issues } from "@paperclipai/db";
+import { agents, companies, createDb, executionWorkspaces, executionWorkspaceRepositories, heartbeatRuns, issues } from "@paperclipai/db";
 import { executionWorkspaceService } from "../services/execution-workspaces.js";
 import { executionWorkspaceRepositoryService } from "../services/execution-workspace-repositories.js";
 import { listLocalProjectRepositories } from "@paperclipai/adapter-utils/ssh";
@@ -35,6 +35,11 @@ const support = await getEmbeddedPostgresTestSupport();
     [issueId] = (await db.insert(issues).values({ companyId, title: "Projectless task", executionWorkspaceId: workspaceId }).returning()).map(row => row.id);
   }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
   afterAll(async () => { vi.unstubAllEnvs(); await temporary?.cleanup(); if (cwd) await rm(cwd, { recursive: true, force: true }); });
+  const prepareForAdmission = async (input: Parameters<ReturnType<typeof executionWorkspaceRepositoryService>["prepareForAdmission"]>[0]) => {
+    await db.insert(heartbeatRuns).values({ id: input.runId, companyId: input.companyId, agentId: input.agentId,
+      status: "running", responsibleUserId: input.responsibleUserId, contextSnapshot: { issueId: input.issueId } }).onConflictDoNothing();
+    return executionWorkspaceRepositoryService(db).prepareForAdmission(input);
+  };
   const request = (requestKey: string, ref?: string) => executionWorkspaceRepositoryService(db).request({ companyId, issueId, actor, request: { repository: { kind: "catalog", id: "123" }, requestKey, ...(ref ? { ref } : {}) } });
   it("publishes a requested repository from an absent path through real admission locking and cloning", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "paperclip-fresh-repository-"));
@@ -88,13 +93,13 @@ const support = await getEmbeddedPostgresTestSupport();
         .where(eq(executionWorkspaceRepositories.id, readyIntent.operationId));
       // New service instances emulate the controller restart between request
       // and admission; concurrent admissions must publish one owned checkout.
-      const pending = Promise.all([1, 2].map(() => executionWorkspaceRepositoryService(db).prepareForAdmission(admission)));
+      const pending = Promise.all([1, 2].map(() => prepareForAdmission(admission)));
       let results: Awaited<typeof pending>;
       let timeout: ReturnType<typeof setTimeout> | undefined;
       try {
         await vi.waitFor(async () => expect(await lstat(cloneStarted).catch(() => null)).not.toBeNull());
         const ready = await Promise.race([
-          executionWorkspaceRepositoryService(db).prepareForAdmission({ ...admission, workspaceId: readyWorkspace.id, issueId: readyTask.id }),
+          prepareForAdmission({ ...admission, workspaceId: readyWorkspace.id, issueId: readyTask.id, runId: randomUUID() }),
           new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error("Unrelated repository reuse waited for a blocked clone")), 2000); }),
         ]);
         expect(ready[0]).toMatchObject({ id: readyIntent.operationId, pinnedCommit: pin });
@@ -123,7 +128,7 @@ const support = await getEmbeddedPostgresTestSupport();
       expect((await db.select().from(executionWorkspaceRepositories).where(eq(executionWorkspaceRepositories.id, intent.operationId)))[0])
         .toMatchObject({ state: "ready", pinnedCommit: pin, failureCode: null });
       await writeFile(path.join(checkout, "source.txt"), "retained dirty work\n");
-      await executionWorkspaceRepositoryService(db).prepareForAdmission(admission);
+      await prepareForAdmission(admission);
       expect(await readFile(path.join(checkout, "source.txt"), "utf8")).toBe("retained dirty work\n");
     } finally {
       if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath;
@@ -146,7 +151,7 @@ const support = await getEmbeddedPostgresTestSupport();
       const [task] = await db.insert(issues).values({ companyId, title: "Unsafe staging", executionWorkspaceId: workspace.id }).returning();
       await executionWorkspaceRepositoryService(db).request({ companyId, issueId: task.id, actor,
         request: { repository: { kind: "catalog", id: "123" }, requestKey: "unsafe-staging" } });
-      await expect(executionWorkspaceRepositoryService(db).prepareForAdmission({ companyId, issueId: task.id,
+      await expect(prepareForAdmission({ companyId, issueId: task.id,
         workspaceId: workspace.id, cwd: taskRoot, agentId, runId: randomUUID(), responsibleUserId: "local-board" }))
         .rejects.toThrow(unsafeEntry === "parent" ? "staging directory escapes" : "ignore file is not a regular file");
       expect(await readdir(outside)).toEqual([]);
@@ -174,7 +179,7 @@ const support = await getEmbeddedPostgresTestSupport();
     catalog.available = false;
     try {
       await expect(request("one")).rejects.toThrow(/no longer available/);
-      await expect(executionWorkspaceRepositoryService(db).prepareForAdmission({ companyId, issueId, workspaceId, cwd, agentId, runId: randomUUID(), responsibleUserId: "local-board" })).rejects.toThrow(/no longer available/);
+      await expect(prepareForAdmission({ companyId, issueId, workspaceId, cwd, agentId, runId: randomUUID(), responsibleUserId: "local-board" })).rejects.toThrow(/no longer available/);
     } finally { catalog.available = true; }
   });
   it("retains durable ownership when Git bundle restoration omits the temporary receipt", async () => {
@@ -190,7 +195,7 @@ const support = await getEmbeddedPostgresTestSupport();
     const commit = await git("rev-parse", "HEAD");
     await db.update(executionWorkspaceRepositories).set({ pinnedCommit: commit, state: "ready" }).where(eq(executionWorkspaceRepositories.id, inventory.id));
     await writeFile(path.join(checkout, "source.txt"), "uncommitted work\n");
-    const prepared = await executionWorkspaceRepositoryService(db).prepareForAdmission({ companyId, issueId, workspaceId, cwd, agentId, runId: randomUUID(), responsibleUserId: "local-board" });
+    const prepared = await prepareForAdmission({ companyId, issueId, workspaceId, cwd, agentId, runId: randomUUID(), responsibleUserId: "local-board" });
     expect(prepared).toHaveLength(1);
     expect(prepared[0].pinnedCommit).toBe(commit);
     expect(await readFile(path.join(checkout, "source.txt"), "utf8")).toBe("uncommitted work\n");
@@ -202,7 +207,7 @@ const support = await getEmbeddedPostgresTestSupport();
       let deadline: ReturnType<typeof setTimeout> | undefined;
       try {
         await Promise.race([
-          executionWorkspaceRepositoryService(db).prepareForAdmission({ companyId, issueId, workspaceId, cwd, agentId, runId: randomUUID(), responsibleUserId: "local-board" }),
+          prepareForAdmission({ companyId, issueId, workspaceId, cwd, agentId, runId: randomUUID(), responsibleUserId: "local-board" }),
           new Promise((_, reject) => { deadline = setTimeout(() => reject(new Error("FIFO receipt blocked admission")), 3000); }),
         ]);
       } finally {
@@ -223,7 +228,7 @@ const support = await getEmbeddedPostgresTestSupport();
     const intent = await service.request({ companyId, issueId: secondIssue.id, actor, request: { repository: { kind: "catalog", id: "123" }, requestKey: "shared-second" } });
     const admission = { companyId, issueId: secondIssue.id, workspaceId: secondWorkspace.id, cwd, agentId: secondAgent.id, runId: randomUUID(), responsibleUserId: null };
     const [original] = await db.select().from(executionWorkspaceRepositories).where(eq(executionWorkspaceRepositories.executionWorkspaceId, workspaceId));
-    const prepared = await service.prepareForAdmission(admission);
+    const prepared = await prepareForAdmission(admission);
     expect(prepared[0]).toMatchObject({ id: intent.operationId, cwd: path.join(await realpath(cwd), original.relativePath), pinnedCommit: original.pinnedCommit });
     expect(await readFile(path.join(prepared[0].cwd, "source.txt"), "utf8")).toBe("uncommitted work\n");
     // There is still one physical checkout and neither its files nor Git metadata were rewritten.
@@ -231,7 +236,7 @@ const support = await getEmbeddedPostgresTestSupport();
     const [differentRefWorkspace] = await db.insert(executionWorkspaces).values({ companyId, name: "Conflicting ref", cwd, mode: "shared_workspace", strategyType: "operator_directory" }).returning();
     const [differentRefIssue] = await db.insert(issues).values({ companyId, title: "Different ref", executionWorkspaceId: differentRefWorkspace.id }).returning();
     await service.request({ companyId, issueId: differentRefIssue.id, actor, request: { repository: { kind: "catalog", id: "123" }, ref: "release", requestKey: "conflicting-ref" } });
-    await expect(service.prepareForAdmission({ ...admission, issueId: differentRefIssue.id, workspaceId: differentRefWorkspace.id })).rejects.toThrow(/different ref/);
+    await expect(prepareForAdmission({ ...admission, issueId: differentRefIssue.id, workspaceId: differentRefWorkspace.id, runId: randomUUID() })).rejects.toThrow(/different ref/);
     const [privateSource] = await db.insert(issues).values({ companyId, title: "Retained private source", visibility: "private" }).returning();
     const owner = executionWorkspaceService(db);
     await owner.bindTaskWorkspace(companyId, privateSource.id, workspaceId);
@@ -240,7 +245,7 @@ const support = await getEmbeddedPostgresTestSupport();
     const [retainedWorkspace] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, workspaceId));
     expect(retainedWorkspace.metadata?._issuePrivacySources).toMatchObject({ [privateSource.id]: true });
     // Reauthorization also applies after the second inventory has a durable pin.
-    await expect(service.prepareForAdmission(admission)).rejects.toThrow(/outside this actor's access/);
+    await expect(prepareForAdmission(admission)).rejects.toThrow(/outside this actor's access/);
     expect(await readFile(path.join(prepared[0].cwd, "source.txt"), "utf8")).toBe("uncommitted work\n");
   });
   it("stages a root change without replacing active files or adding a wake", async () => {

@@ -13,7 +13,7 @@ import request from "supertest";
 import { taskWorkspaceRoutes } from "../routes/task-workspaces.js";
 import { issueRoutes } from "../routes/issues.js";
 import { errorHandler } from "../middleware/error-handler.js";
-import { agents, authUsers, companies, companyMemberships, createDb, executionWorkspaceRepositories, executionWorkspaces, heartbeatRuns, issues, principalPermissionGrants, projects, projectWorkspaces } from "@paperclipai/db";
+import { agents, authUsers, companies, companyMemberships, completionContracts, createDb, environmentLeases, executionWorkspaceRepositories, executionWorkspaces, heartbeatRuns, issues, nativeRunFinalizations, nativeRunResults, workspaceOperations, principalPermissionGrants, projects, projectWorkspaces } from "@paperclipai/db";
 import { executionWorkspaceService } from "../services/execution-workspaces.js";
 import { authorizationService, canActorReadExecutionWorkspace } from "../services/authorization.js";
 import { assertChatExecutionDefaultsAccess } from "../services/chat-execution-defaults.js";
@@ -194,6 +194,83 @@ const support = await getEmbeddedPostgresTestSupport();
     expect((await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, f.workspaceId)))[0]?.metadata)
       .toMatchObject({ _issuePrivacySources: { [f.issueId]: true } });
     await expect(svc.selectTaskWorkspace({ ...request, requestKey: "stale" })).rejects.toThrow("binding changed");
+  });
+
+  describe.each(["pending selection", "legacy update"] as const)("native settlement before %s", (entryPoint) => {
+    let isolatedWorkspacesEnabled: boolean;
+    beforeAll(async () => {
+      isolatedWorkspacesEnabled = (await instanceSettingsService(db).getExperimental()).enableIsolatedWorkspaces;
+      await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+    });
+    afterAll(async () => { await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: isolatedWorkspacesEnabled }); });
+    async function settledNativeTask(failureCode = "native_retry_cancelled", acceptedResult = false) {
+      const f = await fixture(), svc = executionWorkspaceService(db);
+      await svc.bindTaskWorkspace(f.companyId, f.issueId, f.workspaceId);
+      const [agent] = await db.insert(agents).values({ companyId: f.companyId, name: "Stopped worker" }).returning();
+      const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: agent.id,
+        nativeIssueId: f.issueId, runtimeMode: "native", nativePhase: "terminal_failure", status: "cancelled",
+        contextSnapshot: {}, finishedAt: new Date() }).returning();
+      let resultId: string | null = null;
+      if (acceptedResult) {
+        const [contract] = await db.insert(completionContracts).values({ companyId: f.companyId, issueId: f.issueId,
+          revision: 1, schemaVersion: "paperclip.completion-contract.v1", policyVersion: "test", risk: "low",
+          completionAuthority: "agent", incompleteCriteriaPolicy: "block", contractJson: {}, canonicalSha256: "contract",
+          createdByActorType: "agent", createdByActorId: agent.id }).returning();
+        await db.update(heartbeatRuns).set({ completionContractId: contract.id }).where(eq(heartbeatRuns.id, run.id));
+        const [result] = await db.insert(nativeRunResults).values({ companyId: f.companyId, issueId: f.issueId, runId: run.id,
+          completionContractId: contract.id, serverFingerprint: randomUUID(), schemaStatus: "accepted", resultJson: {}, canonicalSha256: "result" }).returning();
+        resultId = result.id;
+      }
+      await db.insert(nativeRunFinalizations).values({ companyId: f.companyId, issueId: f.issueId, runId: run.id,
+        phase: "terminal_failure", failureCode, resultId });
+      const [lease] = await db.insert(environmentLeases).values({ companyId: f.companyId, issueId: f.issueId,
+        heartbeatRunId: run.id, executionWorkspaceId: f.workspaceId, status: "released", cleanupStatus: "success", releasedAt: new Date() }).returning();
+      if (entryPoint === "pending selection") await svc.selectTaskWorkspace({ ...f, selection: { kind: "task_directory" }, expectedBindingRevision: 1, requestKey: "after-stop" });
+      const change = () => entryPoint === "pending selection"
+        ? svc.applyPendingTaskWorkspaceSelection({ ...f, runId: randomUUID() })
+        : issueService(db).update(f.issueId, { executionWorkspaceId: null });
+      return { ...f, run, lease, svc, change };
+    }
+
+    it.each(["native_retry_cancelled", "native_permission_declined"])("allows a settled %s without deleting its historical failure", async (failureCode) => {
+      const f = await settledNativeTask(failureCode);
+      await f.change();
+      expect(await f.svc.inspectTaskWorkspace(f.companyId, f.issueId, f.actor)).toMatchObject({ workspace: null, bindingRevision: 2, pendingSelection: null });
+      expect((await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.run.id)))[0])
+        .toMatchObject({ phase: "terminal_failure", failureCode });
+    });
+
+    it.each(["running native owner", "coordinator owner", "applied result", "pending cleanup", "failed cleanup", "export marker", "active lease", "failed output", "accepted output"] as const)("keeps %s fenced until its durable obligation settles", async (obligation) => {
+      const f = await settledNativeTask("native_retry_cancelled", obligation === "accepted output");
+      if (obligation === "running native owner") await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, f.run.id));
+      if (obligation === "coordinator owner") await db.update(nativeRunFinalizations).set({ leaseOwner: "controller" }).where(eq(nativeRunFinalizations.runId, f.run.id));
+      if (obligation === "applied result") await db.update(nativeRunFinalizations).set({ phase: "applied" }).where(eq(nativeRunFinalizations.runId, f.run.id));
+      if (obligation === "pending cleanup") await db.update(environmentLeases).set({ status: "pending_cleanup" }).where(eq(environmentLeases.id, f.lease.id));
+      if (obligation === "failed cleanup") await db.update(environmentLeases).set({ cleanupStatus: "failed" }).where(eq(environmentLeases.id, f.lease.id));
+      if (obligation === "export marker") await db.update(environmentLeases).set({ metadata: { nativeWorkspaceExportResume: { runId: f.run.id } } }).where(eq(environmentLeases.id, f.lease.id));
+      if (obligation === "active lease") await db.update(environmentLeases).set({ status: "active", releasedAt: null }).where(eq(environmentLeases.id, f.lease.id));
+      if (obligation === "failed output") await db.insert(workspaceOperations).values({ companyId: f.companyId, issueId: f.issueId,
+        heartbeatRunId: f.run.id, executionWorkspaceId: f.workspaceId, phase: "workspace_finalize", status: "failed" });
+      await expect(f.change()).rejects.toThrow(/workspace|Previous task run/);
+      expect(await f.svc.inspectTaskWorkspace(f.companyId, f.issueId, f.actor)).toMatchObject({ workspace: { id: f.workspaceId }, bindingRevision: 1 });
+      if (obligation === "failed output" || obligation === "accepted output") {
+        await db.update(workspaceOperations).set({ createdAt: new Date(0) }).where(eq(workspaceOperations.heartbeatRunId, f.run.id));
+        await db.insert(workspaceOperations).values({ companyId: f.companyId, issueId: f.issueId,
+          heartbeatRunId: f.run.id, executionWorkspaceId: f.workspaceId, phase: "workspace_finalize", status: "succeeded", finishedAt: new Date() });
+        await f.change();
+        expect(await f.svc.inspectTaskWorkspace(f.companyId, f.issueId, f.actor)).toMatchObject({ workspace: null, bindingRevision: 2 });
+      }
+    });
+
+    it.each(["warm release", "unsafe export omission"] as const)("accepts a settled %s receipt", async (receipt) => {
+      const f = await settledNativeTask("native_retry_cancelled", receipt === "unsafe export omission");
+      if (receipt === "warm release") await db.update(environmentLeases).set({ releasedAt: null, status: "retained", leasePolicy: "reuse_by_environment", cleanupStatus: "success" }).where(eq(environmentLeases.id, f.lease.id));
+      if (receipt === "unsafe export omission") await db.insert(workspaceOperations).values({ companyId: f.companyId, issueId: f.issueId,
+        heartbeatRunId: f.run.id, executionWorkspaceId: f.workspaceId, phase: "workspace_finalize", status: "succeeded",
+        metadata: { workspaceSync: { omitted: true } }, finishedAt: new Date() });
+      await f.change();
+      expect(await f.svc.inspectTaskWorkspace(f.companyId, f.issueId, f.actor)).toMatchObject({ workspace: null, bindingRevision: 2 });
+    });
   });
 
   it("preserves a queued next-run choice through first binding and its original retry receipt", async () => {

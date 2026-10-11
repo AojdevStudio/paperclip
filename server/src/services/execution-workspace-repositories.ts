@@ -4,13 +4,14 @@ import { promisify } from "node:util";
 import fs from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import path from "node:path";
-import { and, eq, or, sql } from "drizzle-orm";
-import { activityLog, executionWorkspaceRepositories, executionWorkspaces, issues, type Db } from "@paperclipai/db";
+import { and, eq, isNotNull, or, sql } from "drizzle-orm";
+import { activityLog, agents, heartbeatRuns, projects, executionWorkspaceRepositories, executionWorkspaces, issues, type Db } from "@paperclipai/db";
 import { prepareWorkspaceRepositorySchema, type PrepareWorkspaceRepository, type ProjectRepository } from "@paperclipai/shared";
 import { withDirectoryPublicationLock } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { conflict, forbidden, notFound } from "../errors.js";
 import { assertTaskWorkspaceAccess } from "./task-workspace-source-access.js";
 import { authorizationService, canActorReadExecutionWorkspace, issueReadSqlCondition, type AuthorizationActor } from "./authorization.js";
+import { resolveCoreTrustPreset } from "./trust-preset-resolver.js";
 import { captureRunIdentity } from "./run-identity.js";
 import { toolAccessService } from "./tool-access.js";
 import { normalizeProjectRepositoryUrl } from "./project-repositories.js";
@@ -19,6 +20,19 @@ import { materializeManagedProjectWorkspace, ensureManagedRepositoriesIgnored } 
 
 const execFile = promisify(execFileCallback);
 type RepositoryRow = typeof executionWorkspaceRepositories.$inferSelect;
+type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
+
+const lowTrustRepositoryMessage = "Low-trust tasks may prepare anonymous public URLs only. Use an authorized configured source for private repositories.";
+
+function resolveAcquisitionSource(request: PrepareWorkspaceRepository["repository"], available: ProjectRepository[], anonymousOnly: boolean) {
+  if (anonymousOnly && request.kind === "catalog") throw forbidden(lowTrustRepositoryMessage);
+  // A sponsor's catalog is credential discovery, not authority for untrusted work.
+  return resolveTaskRepository(request, anonymousOnly ? [] : available);
+}
+
+function assertAcquisitionReceipt(row: Pick<RepositoryRow, "catalogRepositoryId">, anonymousOnly: boolean) {
+  if (anonymousOnly && row.catalogRepositoryId) throw forbidden(lowTrustRepositoryMessage);
+}
 
 /** The catalog is refreshed on request and admission; saved IDs are not grants. */
 export function resolveTaskRepository(request: PrepareWorkspaceRepository["repository"], available: ProjectRepository[]) {
@@ -44,6 +58,26 @@ export function executionWorkspaceRepositoryService(db: Db) {
   async function catalog(companyId: string, userId: string | null, localTrusted: boolean) {
     return (await toolAccessService(db).listProjectRepositories(companyId, userId, localTrusted)).repositories;
   }
+  async function requiresAnonymousAcquisition(reader: Db | DbTransaction, input: {
+    issue: typeof issues.$inferSelect; workspace: typeof executionWorkspaces.$inferSelect;
+    agentId?: string | null; runId?: string | null;
+  }) {
+    const { issue, workspace } = input;
+    const agentId = input.agentId ?? issue.assigneeAgentId;
+    const [agent] = agentId ? await reader.select().from(agents).where(and(eq(agents.id, agentId), eq(agents.companyId, issue.companyId))) : [];
+    if (agentId && !agent) throw forbidden("Task repository agent is unavailable");
+    const [project] = issue.projectId ? await reader.select().from(projects).where(and(eq(projects.id, issue.projectId), eq(projects.companyId, issue.companyId))) : [];
+    const [workspaceSourceProject] = workspace.projectId ? await reader.select().from(projects).where(and(eq(projects.id, workspace.projectId), eq(projects.companyId, issue.companyId))) : [];
+    const runId = input.runId ?? issue.executionRunId;
+    const [run] = runId ? await reader.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, issue.companyId))) : [];
+    if (runId && (!run || (input.runId && run.agentId !== agentId) || (run.nativeIssueId ?? run.contextSnapshot?.issueId ?? run.contextSnapshot?.taskId ?? run.issueId) !== issue.id)) {
+      throw forbidden("Task repository run identity is unavailable");
+    }
+    const trust = resolveCoreTrustPreset({ companyId: issue.companyId, agent, project, workspaceSourceProject, issue,
+      run: run ? { companyId: run.companyId, executionPolicy: run.contextSnapshot?.executionPolicy } : null });
+    if (trust.kind === "denied") throw forbidden(trust.detail);
+    return trust.kind === "low_trust_review";
+  }
   async function request(input: { companyId: string; issueId: string; actor: AuthorizationActor; request: PrepareWorkspaceRepository }) {
     const parsed = prepareWorkspaceRepositorySchema.parse(input.request);
     const [requestedIssue] = await db.select().from(issues).where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId), await issueReadSqlCondition(db, input.actor)));
@@ -63,7 +97,7 @@ export function executionWorkspaceRepositoryService(db: Db) {
       localTrusted = userId === "local-board";
       if (!userId) throw forbidden("Repository access requires a responsible user");
     }
-    const source = resolveTaskRepository(parsed.repository, await catalog(input.companyId, userId, localTrusted));
+    const available = await catalog(input.companyId, userId, localTrusted);
     const requestedRef = parsed.ref ?? "HEAD";
     const receipt = await db.transaction(async tx => {
       const [issue] = await tx.select().from(issues).where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId), await issueReadSqlCondition(tx, input.actor))).for("no key update");
@@ -77,8 +111,14 @@ export function executionWorkspaceRepositoryService(db: Db) {
       const [workspace] = await tx.select().from(executionWorkspaces).where(and(eq(executionWorkspaces.id, issue.executionWorkspaceId), eq(executionWorkspaces.companyId, input.companyId))).for("no key update");
       if (!workspace || workspace.status !== "active") throw conflict("Execution workspace is unavailable");
       await assertTaskWorkspaceAccess(tx, input.actor, input.companyId, workspace.id, { write: true, issueId: input.issueId });
+      const anonymousOnly = await requiresAnonymousAcquisition(tx, { issue, workspace,
+        agentId: input.actor.agentId, runId: input.actor.runId });
+      const source = resolveAcquisitionSource(parsed.repository, available, anonymousOnly);
       const existing = await tx.select().from(executionWorkspaceRepositories).where(and(eq(executionWorkspaceRepositories.executionWorkspaceId, workspace.id), or(eq(executionWorkspaceRepositories.repositoryIdentity, source.repositoryIdentity), sql`${executionWorkspaceRepositories.requestKeys} ? ${parsed.requestKey}`)));
-      for (const row of existing) assertRepositoryRetryMatches(row, source.repositoryIdentity, requestedRef);
+      for (const row of existing) {
+        assertAcquisitionReceipt(row, anonymousOnly);
+        assertRepositoryRetryMatches(row, source.repositoryIdentity, requestedRef);
+      }
       if (existing[0]) {
         const row = existing[0];
         if (!row.requestKeys.includes(parsed.requestKey)) {
@@ -99,7 +139,7 @@ export function executionWorkspaceRepositoryService(db: Db) {
   }
   /** Logical rows may deliberately name one physical folder. Reuse bytes only
    * after validating every published owner's retained privacy and source intent. */
-  async function sharedPublicationPin(input: { issueId: string; row: RepositoryRow; root: string; actor: AuthorizationActor; ownership: { repositoryId?: string; pinnedCommit?: string } | null }) {
+  async function sharedPublicationPin(input: { issueId: string; row: RepositoryRow; root: string; actor: AuthorizationActor; anonymousOnly: boolean; ownership: { repositoryId?: string; pinnedCommit?: string } | null }) {
     const candidates = await db.select({ repository: executionWorkspaceRepositories, workspace: executionWorkspaces })
       .from(executionWorkspaceRepositories).innerJoin(executionWorkspaces, eq(executionWorkspaces.id, executionWorkspaceRepositories.executionWorkspaceId))
       .where(and(eq(executionWorkspaceRepositories.companyId, input.row.companyId), eq(executionWorkspaces.companyId, input.row.companyId),
@@ -111,6 +151,7 @@ export function executionWorkspaceRepositoryService(db: Db) {
       // An intent that has not published anything cannot claim another task's checkout.
       if (!candidatePin || !/^[a-f0-9]{40,64}$/.test(candidatePin)) continue;
       if (await fs.realpath(workspace.cwd).catch(() => null) !== input.root) continue;
+      assertAcquisitionReceipt(repository, input.anonymousOnly);
       assertRepositoryRetryMatches(repository, input.row.repositoryIdentity, input.row.requestedRef);
       if (!(await canActorReadExecutionWorkspace(db, input.actor, workspace.id))) throw forbidden("The shared repository retains files from a workspace outside this actor's access");
       await assertTaskWorkspaceAccess(db, input.actor, input.row.companyId, workspace.id, { write: true, issueId: input.issueId });
@@ -119,18 +160,43 @@ export function executionWorkspaceRepositoryService(db: Db) {
     }
     return pin;
   }
+  async function assertAnonymousPhysicalRoot(companyId: string, root: string) {
+    const publications = await db.select({ repository: executionWorkspaceRepositories, cwd: executionWorkspaces.cwd })
+      .from(executionWorkspaceRepositories).innerJoin(executionWorkspaces, eq(executionWorkspaces.id, executionWorkspaceRepositories.executionWorkspaceId))
+      .where(and(eq(executionWorkspaceRepositories.companyId, companyId), eq(executionWorkspaces.companyId, companyId),
+        isNotNull(executionWorkspaceRepositories.catalogRepositoryId)));
+    for (const { repository, cwd } of publications) {
+      if (!cwd || await fs.realpath(cwd).catch(() => null) !== root) continue;
+      if (repository.relativePath !== taskRepositoryRelativePath(repository.repositoryIdentity)) throw conflict("Repository preparation receipt does not match its source");
+      // Include an interrupted publication whose database pin was not saved yet.
+      // Even another repository's files would be included in the root snapshot.
+      if (repository.pinnedCommit || await fs.lstat(path.join(root, repository.relativePath)).catch(() => null)) {
+        throw forbidden(lowTrustRepositoryMessage);
+      }
+    }
+  }
   async function prepareForAdmission(input: { companyId: string; issueId: string; workspaceId: string; cwd: string; agentId: string; runId: string; responsibleUserId: string | null }) {
     const rows = await list(input.companyId, input.workspaceId);
-    if (!rows.length) return [];
-    const available = await catalog(input.companyId, input.responsibleUserId, input.responsibleUserId === "local-board");
-    const resolveAuth = createGitRemoteAuthProvider(db, input.companyId, { issueId: input.issueId, heartbeatRunId: input.runId, agentId: input.agentId, responsibleUserId: input.responsibleUserId });
     const actor: AuthorizationActor = { type: "agent", source: "agent_jwt", companyId: input.companyId,
       agentId: input.agentId, runId: input.runId,
       // local-board is a server identity, not a membership record. Preserve the
       // agent's own authority rather than promoting it to a board actor.
       onBehalfOfUserId: input.responsibleUserId === "local-board" ? null : input.responsibleUserId };
     await assertTaskWorkspaceAccess(db, actor, input.companyId, input.workspaceId, { write: true, issueId: input.issueId });
+    const [issue] = await db.select().from(issues).where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)));
+    const [workspace] = await db.select().from(executionWorkspaces).where(and(eq(executionWorkspaces.id, input.workspaceId), eq(executionWorkspaces.companyId, input.companyId)));
+    if (!issue || !workspace || issue.executionWorkspaceId !== workspace.id) throw forbidden("Task repository workspace binding is unavailable");
+    const anonymousOnly = await requiresAnonymousAcquisition(db, { issue, workspace, agentId: input.agentId, runId: input.runId });
     const root = await fs.realpath(input.cwd);
+    if (anonymousOnly) await assertAnonymousPhysicalRoot(input.companyId, root);
+    if (!rows.length) return [];
+    const available = anonymousOnly ? [] : await catalog(input.companyId, input.responsibleUserId, input.responsibleUserId === "local-board");
+    const resolveAuth = createGitRemoteAuthProvider(db, input.companyId, { issueId: input.issueId, heartbeatRunId: input.runId, agentId: input.agentId, responsibleUserId: input.responsibleUserId });
+    // Validate every receipt before reading or transferring any prepared bytes.
+    const sources = rows.map(row => {
+      assertAcquisitionReceipt(row, anonymousOnly);
+      return resolveAcquisitionSource(row.catalogRepositoryId ? { kind: "catalog", id: row.catalogRepositoryId } : { kind: "url", url: row.repoUrl }, available, anonymousOnly);
+    });
     const repositoryRoot = path.join(root, ".paperclip-repositories");
     await fs.mkdir(repositoryRoot, { recursive: true });
     if ((await fs.lstat(repositoryRoot)).isSymbolicLink() || await fs.realpath(repositoryRoot) !== repositoryRoot) throw conflict("Repository directory escapes the task workspace");
@@ -164,8 +230,8 @@ export function executionWorkspaceRepositoryService(db: Db) {
     } finally { await fs.rm(ignoreTemporary, { force: true }); }
     await ensureManagedRepositoriesIgnored(root);
     const prepared: Array<{ id: string; cwd: string; repoUrl: string; relativePath: string; pinnedCommit: string; branchName: string | null }> = [];
-    for (const row of rows) {
-      const source = resolveTaskRepository(row.catalogRepositoryId ? { kind: "catalog", id: row.catalogRepositoryId } : { kind: "url", url: row.repoUrl }, available);
+    for (const [index, row] of rows.entries()) {
+      const source = sources[index];
       if (source.repositoryIdentity !== row.repositoryIdentity || row.relativePath !== taskRepositoryRelativePath(row.repositoryIdentity)) throw conflict("Repository preparation receipt does not match its source");
       const cwd = path.join(root, row.relativePath);
       await withDirectoryPublicationLock(cwd, async () => {
@@ -194,7 +260,7 @@ export function executionWorkspaceRepositoryService(db: Db) {
             } catch { return null; } finally { await handle.close(); }
           };
           const initialOwnership = await readOwnership();
-          const authorizedPin = await sharedPublicationPin({ issueId: input.issueId, row, root, actor, ownership: initialOwnership });
+          const authorizedPin = await sharedPublicationPin({ issueId: input.issueId, row, root, actor, anonymousOnly, ownership: initialOwnership });
           if (existing && !authorizedPin && initialOwnership?.repositoryId !== row.id) {
             throw conflict("Repository directory has no matching preparation receipt; repair it before retrying");
           }

@@ -21,6 +21,8 @@ import {
   agents,
   heartbeatRuns,
   nativeRunFinalizations,
+  environmentLeases,
+  workspaceOperations,
   issueComments,
   issueWorkProducts,
   issues,
@@ -1290,6 +1292,51 @@ type WorkspaceOverviewIssueRow = WorkspaceOverviewLinkedIssue & {
 
 const inspectGitForDisplay = createWorkspaceGitInspectionCache(inspectGitCloseReadiness);
 
+/** A failed response can be settled without a committed task result. Its durable
+ * output and resource obligations still fence root changes, including after Stop. */
+async function hasPendingTaskWorkspaceRecovery(tx: DbTransaction, input: {
+  companyId: string; issueId: string; excludeRunId?: string;
+}) {
+  const rows = await tx.select({ finalization: nativeRunFinalizations, run: heartbeatRuns })
+    .from(nativeRunFinalizations).innerJoin(heartbeatRuns, and(
+      eq(heartbeatRuns.companyId, nativeRunFinalizations.companyId), eq(heartbeatRuns.id, nativeRunFinalizations.runId),
+    )).where(and(eq(nativeRunFinalizations.companyId, input.companyId), eq(nativeRunFinalizations.issueId, input.issueId),
+      input.excludeRunId ? ne(nativeRunFinalizations.runId, input.excludeRunId) : undefined));
+  if (rows.length === 0) return false;
+  if (rows.some(({ finalization, run }) => finalization.leaseOwner ||
+      !["committed", "terminal_failure"].includes(finalization.phase) ||
+      !["succeeded", "interrupted", "failed", "cancelled", "timed_out"].includes(run.status))) return true;
+  const runIds = rows.map(({ run }) => run.id);
+  const [pendingLease] = await tx.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
+    eq(environmentLeases.companyId, input.companyId), inArray(environmentLeases.heartbeatRunId, runIds),
+    or(and(isNull(environmentLeases.releasedAt),
+        // A successful warm release settles the old run while keeping its resource.
+        sql`not coalesce(${environmentLeases.status} = 'retained'
+          and ${environmentLeases.leasePolicy} = 'reuse_by_environment'
+          and ${environmentLeases.cleanupStatus} = 'success', false)`),
+      eq(environmentLeases.status, "pending_cleanup"), eq(environmentLeases.cleanupStatus, "failed"),
+      sql`${environmentLeases.metadata} ? 'nativeWorkspaceExportResume'`),
+  )).limit(1);
+  if (pendingLease) return true;
+  const operations = await tx.select({ runId: workspaceOperations.heartbeatRunId, status: workspaceOperations.status })
+    .from(workspaceOperations).where(and(eq(workspaceOperations.companyId, input.companyId),
+      inArray(workspaceOperations.heartbeatRunId, runIds), eq(workspaceOperations.phase, "workspace_finalize")))
+    .orderBy(desc(workspaceOperations.createdAt),
+      // Equal timestamps cannot prove that success settled another attempt.
+      asc(sql`case when ${workspaceOperations.status} = 'succeeded' then 1 else 0 end`));
+  const latest = new Map<string, string>();
+  for (const operation of operations) {
+    if (operation.runId && !latest.has(operation.runId)) latest.set(operation.runId, operation.status);
+  }
+  return rows.some(({ finalization, run }) => {
+    const status = latest.get(run.id);
+    if (status !== undefined) return status !== "succeeded";
+    // Accepted output needs its persistence receipt, including terminal export
+    // repair. A successful unsafe-export omission is also a settled receipt.
+    return finalization.phase === "terminal_failure" && finalization.resultId !== null;
+  });
+}
+
 export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServiceOptions = {}) {
   /** Resolve prospective source use from the same deterministic inputs as admission. */
   async function resolveSourceWorkspaceStrategy(input: {
@@ -1417,14 +1464,12 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       if (pending.expectedBindingRevision !== task.workspaceBindingRevision) throw conflict("Pending workspace selection is stale");
       const [holder] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
         eq(heartbeatRuns.companyId, input.companyId), ne(heartbeatRuns.id, input.runId),
-        sql`coalesce(${heartbeatRuns.contextSnapshot}->>'issueId', ${heartbeatRuns.contextSnapshot}->>'taskId') = ${input.issueId}`,
+        or(eq(heartbeatRuns.nativeIssueId, input.issueId),
+          sql`coalesce(${heartbeatRuns.contextSnapshot}->>'issueId', ${heartbeatRuns.contextSnapshot}->>'taskId') = ${input.issueId}`),
         eq(heartbeatRuns.status, "running"),
       )).limit(1);
       if (holder) throw conflict("Previous task run must finish persistence before changing its workspace");
-      const [unsettled] = await tx.select({ runId: nativeRunFinalizations.runId }).from(nativeRunFinalizations).where(and(
-        eq(nativeRunFinalizations.companyId, input.companyId), eq(nativeRunFinalizations.issueId, input.issueId),
-        ne(nativeRunFinalizations.runId, input.runId), ne(nativeRunFinalizations.phase, "committed"),
-      )).limit(1);
+      const unsettled = await hasPendingTaskWorkspaceRecovery(tx, { ...input, excludeRunId: input.runId });
       if (unsettled) throw conflict("Previous task run still owns workspace recovery; finish recovery before changing its workspace");
       const patch = await validateSelection({ ...input, selection: pending.intent.selection }, tx);
       await tx.update(issues).set({ ...patch, workspaceSelection: pending.intent, workspacePendingSelection: null,
@@ -1497,10 +1542,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         sql`coalesce(${heartbeatRuns.contextSnapshot}->>'issueId', ${heartbeatRuns.contextSnapshot}->>'taskId') = ${input.issueId}`,
         task.executionRunId ? eq(heartbeatRuns.id, task.executionRunId) : undefined),
     )).limit(1);
-    const [unsettled] = await tx.select({ runId: nativeRunFinalizations.runId }).from(nativeRunFinalizations).where(and(
-      eq(nativeRunFinalizations.companyId, input.companyId), eq(nativeRunFinalizations.issueId, input.issueId),
-      ne(nativeRunFinalizations.phase, "committed"),
-    )).limit(1);
+    const unsettled = await hasPendingTaskWorkspaceRecovery(tx, input);
     if (holder || unsettled) throw conflict("Task run still owns its workspace; schedule a workspace selection for the next admission");
     const [selectedWorkspace] = input.patch.executionWorkspaceId
       ? await tx.select({ projectWorkspaceId: executionWorkspaces.projectWorkspaceId }).from(executionWorkspaces).where(and(
