@@ -1250,8 +1250,19 @@ When a workspace service runs Paperclip for browser OAuth QA, configure its `exp
 Keep relevant heartbeat extractions and their focused tests in `server/src/services/heartbeat/`.
 
 Task assignment Markdown is rendered by `server/src/services/heartbeat/task-markdown.ts`.
-`heartbeat.ts` calls the renderer and re-exports it for existing callers. Keep prompt
+`heartbeat.ts` re-exports it for existing callers. Keep prompt
 formatting changes in the renderer and its tests, separate from run orchestration.
+
+Task context assembly is in `server/src/services/heartbeat/task-context.ts`.
+`prepareHeartbeatTaskContext` rebuilds prompt fields on the current run context:
+continuation summaries, wake comments, task plans, communication guidance, and
+full/compact assignment Markdown. It preserves quarantine and secret redaction
+before computing turn-context revisions. The executor supplies the already-loaded
+issue, session, and trust policy, and retains admission, resource ownership, and
+cleanup. Public-path characterization tests are in
+`server/src/__tests__/heartbeat-task-context.test.ts`; the workspace-bootstrap
+browser fixture also checks the persisted prompt variants and description revision
+from a real process adapter before completing its task.
 
 Run-log formatting is in `server/src/services/heartbeat/run-log.ts`. It bounds
 stored event payloads, redacts and shortens log chunks, and caps stdout/stderr
