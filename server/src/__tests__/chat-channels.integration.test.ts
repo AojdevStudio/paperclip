@@ -33011,6 +33011,26 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           await set("delivery_unknown");
           expect(await f.service.nextChatActionAt(kind)).toBeNull();
           expect(await due()).toBe(false);
+        } else if (kind === "failed_run_retry") {
+          expect(await due()).toBe(false);
+          await set("issued");
+          expect(await due()).toBe(true);
+          await set("issued", { retryAt: later.toISOString() });
+          expect(await f.service.nextChatActionAt(kind)).toBe(later.getTime());
+          expect(await due()).toBe(false);
+          await set("processing");
+          expect(await f.service.nextChatActionAt(kind)).toBe(at.getTime() + 60_000);
+          expect(await due()).toBe(false);
+          // Both the claim lease and retry time must expire before replay.
+          await set("processing", { retryAt: later.toISOString() });
+          expect(await f.service.nextChatActionAt(kind)).toBe(later.getTime());
+          await set("processing", { retryAt: at.toISOString() });
+          expect(await f.service.nextChatActionAt(kind)).toBe(at.getTime() + 60_000);
+          for (const status of ["failed", "cancelled", "processed"]) {
+            await set(status, { retryable: true, retryAt: at.toISOString() });
+            expect(await f.service.nextChatActionAt(kind)).toBeNull();
+            expect(await due()).toBe(false);
+          }
         } else if (kind === "slack_session_sync") {
           expect(await due()).toBe(true);
           await set("received", { retryAt: later.toISOString() });
@@ -60328,6 +60348,73 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           rmSync(stateDirectory, { recursive: true, force: true });
         }
       }
+    },
+  );
+
+  it.each(["commit", "retry", "startup", "stale_claim", "rollback"] as const)(
+    "drains failed chat retries from durable work and becomes idle: %s",
+    async (mode) => {
+      const context = await failedChatRetryFixture("telegram");
+      const onError = vi.fn();
+      const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError });
+      const input = { companyId: context.fixture.companyId, issueId: context.issue.id,
+        agentId: context.fixture.assignedAgentId, failedRunId: context.runId, initiatedByUserId: "owner-user" };
+      const stage = () => db.transaction(tx => context.service.prepareFailedChatRunRetry(tx, input));
+      context.wakeup.mockClear();
+      try {
+        let actionId: string;
+        if (mode === "startup" || mode === "stale_claim") {
+          ({ actionId } = await stage());
+          if (mode === "stale_claim") await db.update(chatActions).set({ status: "processing",
+            updatedAt: new Date(Date.now() - 120_000) }).where(eq(chatActions.id, actionId));
+          await registerChatActionWork(coordinator, context.service, () => true).ready;
+        } else {
+          await registerChatActionWork(coordinator, context.service, () => true).ready;
+          if (mode === "rollback") {
+            await expect(db.transaction(async tx => {
+              await context.service.prepareFailedChatRunRetry(tx, input);
+              throw new Error("rollback retry intent");
+            })).rejects.toThrow("rollback retry intent");
+            await vi.waitFor(() => expect(coordinator.nextWakeAt()).toBeNull());
+            expect(context.wakeup).not.toHaveBeenCalled();
+          }
+          if (mode === "retry") {
+            let failedAt = 0;
+            context.wakeup.mockImplementationOnce(async () => {
+              failedAt = Date.now();
+              throw new Error("temporary admission outage");
+            }).mockImplementationOnce(async () => {
+              expect(Date.now() - failedAt).toBeGreaterThanOrEqual(250);
+              return { accepted: true };
+            });
+          }
+          ({ actionId } = await db.transaction(async tx => {
+            const staged = await tx.transaction(nested => context.service.prepareFailedChatRunRetry(nested, input));
+            // A nested savepoint must not wake the worker before the outer commit.
+            await new Promise(resolve => setTimeout(resolve, 25));
+            expect(context.wakeup).not.toHaveBeenCalled();
+            return staged;
+          }));
+        }
+        await vi.waitFor(async () => {
+          const [action] = await db.select().from(chatActions).where(eq(chatActions.id, actionId));
+          expect(action?.status).toBe("processed");
+          expect(action?.result.attemptCount).toBe(mode === "retry" ? 2 : 1);
+          expect(coordinator.nextWakeAt()).toBeNull();
+        }, { timeout: 10_000 });
+        expect(context.wakeup).toHaveBeenCalledTimes(mode === "retry" ? 2 : 1);
+        const receipts = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, actionId));
+        expect(receipts).toHaveLength(1);
+        expect(receipts[0]?.payload).toMatchObject({ retryOfRunId: context.runId,
+          wakeCommentIds: [context.action.payload.commentId] });
+        // With all registered queues drained, an idle second must issue no SQL.
+        const scans = vi.spyOn(db, "select");
+        try {
+          await new Promise(resolve => setTimeout(resolve, 1200));
+          expect(scans).not.toHaveBeenCalled();
+        } finally { scans.mockRestore(); }
+        expect(onError).not.toHaveBeenCalled();
+      } finally { await coordinator.stop(); await context.service.shutdown(); }
     },
   );
 

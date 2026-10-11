@@ -1,4 +1,4 @@
-import { dueChatAction, nextChatActionAt, SLACK_COMMAND_POST_STALE_MS, SLACK_COMMAND_EXPLICIT_RETRY_STALE_MS, SLACK_COMMAND_ADMISSION_STALE_MS, PROVIDER_EFFECT_STALE_MS } from "./chat-action-work.js";
+import { FAILED_RUN_RETRY_STALE_MS, dueChatAction, nextChatActionAt, SLACK_COMMAND_POST_STALE_MS, SLACK_COMMAND_EXPLICIT_RETRY_STALE_MS, SLACK_COMMAND_ADMISSION_STALE_MS, PROVIDER_EFFECT_STALE_MS } from "./chat-action-work.js";
 import type { ScheduledChatAction } from "./chat-work-notifications.js";
 import { notifyChatDeliveryWork, notifyChatPublicationWork, notifyChatEndpointWork, notifyChatActionWork, notifyChatVerificationWork } from "./chat-work-notifications.js";
 import { syncSpekoVoiceTools } from "./voice/speko-agent-tools.js";
@@ -13056,6 +13056,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       .limit(1);
     if (busy || !input.initiatedByUserId) throw failedChatRetryDenied();
     const now = new Date();
+    await notifyChatActionWork(tx, "failed_run_retry");
     const [intent] = await tx
       .insert(chatActions)
       .values({
@@ -13299,36 +13300,42 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       !["issued", "processing"].includes(candidate.status) ||
       (candidate.status === "processing" &&
         candidate.updatedAt.getTime() >
-          now.getTime() - DELIVERY_PROCESSING_STALE_MS) ||
+          now.getTime() - FAILED_RUN_RETRY_STALE_MS) ||
       (typeof candidate.result?.retryAt === "string" &&
         Date.parse(candidate.result.retryAt) > now.getTime())
     )
       return failedChatRetryReceipt(candidate);
-    const [claimed] = await db
-      .update(chatActions)
-      .set({ status: "processing", updatedAt: now })
-      .where(
-        and(
-          eq(chatActions.id, candidate.id),
-          eq(chatActions.status, candidate.status),
-          eq(chatActions.updatedAt, candidate.updatedAt),
-        ),
-      )
-      .returning();
-    if (!claimed) return failedChatRetryReceipt(candidate);
-    const attemptCount = Number(candidate.result?.attemptCount ?? 0) + 1;
-    const settle = async (status: string, result: Record<string, unknown>) => {
-      const [current] = await db
+    const [claimed] = await db.transaction(async (tx) => {
+      await notifyChatActionWork(tx, "failed_run_retry");
+      return tx
         .update(chatActions)
-        .set({ status, result, updatedAt: new Date() })
+        .set({ status: "processing", updatedAt: now })
         .where(
           and(
-            eq(chatActions.id, claimed.id),
-            eq(chatActions.status, "processing"),
-            eq(chatActions.updatedAt, now),
+            eq(chatActions.id, candidate.id),
+            eq(chatActions.status, candidate.status),
+            eq(chatActions.updatedAt, candidate.updatedAt),
           ),
         )
         .returning();
+    });
+    if (!claimed) return failedChatRetryReceipt(candidate);
+    const attemptCount = Number(candidate.result?.attemptCount ?? 0) + 1;
+    const settle = async (status: string, result: Record<string, unknown>) => {
+      const [current] = await db.transaction(async (tx) => {
+        await notifyChatActionWork(tx, "failed_run_retry");
+        return tx
+          .update(chatActions)
+          .set({ status, result, updatedAt: new Date() })
+          .where(
+            and(
+              eq(chatActions.id, claimed.id),
+              eq(chatActions.status, "processing"),
+              eq(chatActions.updatedAt, now),
+            ),
+          )
+          .returning();
+      });
       return failedChatRetryReceipt(current ?? claimed);
     };
     try {
@@ -13460,26 +13467,10 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
 
   async function processFailedChatRunRetries(limit = 20) {
     if (shuttingDown) return 0;
-    const now = new Date();
     const candidates = await db
       .select({ id: chatActions.id })
       .from(chatActions)
-      .where(
-        and(
-          eq(chatActions.kind, "failed_run_retry"),
-          or(
-            eq(chatActions.status, "issued"),
-            and(
-              eq(chatActions.status, "processing"),
-              lte(
-                chatActions.updatedAt,
-                new Date(now.getTime() - DELIVERY_PROCESSING_STALE_MS),
-              ),
-            ),
-          ),
-          sql`(${chatActions.result}->>'retryAt' is null or (${chatActions.result}->>'retryAt')::timestamptz <= ${now.toISOString()}::timestamptz)`,
-        ),
-      )
+      .where(dueChatAction("failed_run_retry"))
       .orderBy(asc(chatActions.createdAt), asc(chatActions.id))
       .limit(Math.max(1, Math.min(50, limit)));
     for (const candidate of candidates)
@@ -28082,7 +28073,6 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
   async function processPendingChatMaintenance(limit = 25) {
     return Promise.allSettled([
       processPendingTelegramMaintenance(limit),
-      processFailedChatRunRetries(limit),
     ]);
   }
 
@@ -28093,7 +28083,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     // so a crashed processing claim is quarantined before the delivery worker
     // could otherwise replay it.
     const actionRecovery = onlyDeliveryId || !maintenance ? null : Promise.allSettled([
-      processPendingChatMaintenance(limit), processPendingGitHubWebhookIngress(limit),
+      processPendingChatMaintenance(limit), processFailedChatRunRetries(limit),
+      processPendingGitHubWebhookIngress(limit),
       processPendingProviderEffects(limit), processPendingSlackBoardMessages(limit),
       processPendingSlackTaskStarts(limit), processPendingReceiptReactions(limit),
       processPendingSlackSessionStops(limit), slackRegistration.processPendingVerificationMessages(limit),
