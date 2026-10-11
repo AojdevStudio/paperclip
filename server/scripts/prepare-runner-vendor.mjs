@@ -9,12 +9,14 @@
 // 12-16s on the CI Build job's critical path (six master runs, 2026-10-11)
 // and the same again in every other `pnpm build`.
 //
-// The Runner's `build` now records a digest of its inputs after it succeeds
-// (packages/paperclip-runner/scripts/build-inputs.mjs). This step recomputes
-// the digest and reuses the build when the stamp matches and every output a
-// consumer reads exists; anything else runs the full Runner build exactly as
-// before. The standalone guarantee therefore holds: a fresh checkout, a
-// changed input, or a deleted output always rebuilds. Set
+// The Runner's `build` now records a digest of its inputs, captured before its
+// first step and confirmed after its last, together with a manifest of every
+// file it left under dist (packages/paperclip-runner/scripts/build-inputs.mjs).
+// This step recomputes the digest and reuses the build when the stamp matches
+// and every recorded output is still there at its recorded size; anything else
+// runs the full Runner build exactly as before. The standalone guarantee
+// therefore holds: a fresh checkout, a changed input, a deleted or truncated
+// output, or an edit that landed while the build ran always rebuilds. Set
 // PAPERCLIP_RUNNER_VENDOR_REBUILD=1 to rebuild regardless of the stamp.
 //
 // Usage: node scripts/prepare-runner-vendor.mjs [--repo-root <dir>]
@@ -103,8 +105,10 @@ export function prepareRunnerVendor({
   }
 
   log(`prepare:runner-vendor: rebuilding the Runner (${decision.detail})`);
-  // A build that stops partway must not leave a stamp that vouches for it; the
-  // Runner's own build writes a fresh one as its final step.
+  // A build that stops partway must not leave a stamp that vouches for it. The
+  // Runner's own build removes the stamp in its first step and writes a fresh
+  // one in its last; removing it here as well covers a build command that
+  // fails before its first step runs.
   removeBuildInputsStamp(assessment.stampPath);
   const buildStart = now();
   const status = run(RUNNER_VENDOR_BUILD_COMMAND, { cwd: path.join(repoRoot, "server"), env });

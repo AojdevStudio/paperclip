@@ -565,28 +565,35 @@ the suite on the fresh path.
 The server build vendors `packages/paperclip-runner/dist`, so its
 `prepare:runner-vendor` step has to make sure that directory is a current
 build. It used to run the Runner's full `build` every time. Now the Runner's
-`build` ends by recording a digest of its inputs (every file under
-`packages/paperclip-runner` except `dist`, `dist-browser`, `runner/target`,
-`node_modules` and dot-directories; every file under
-`packages/paperclip-eval-kernel` except `dist` and `node_modules`; and the root
+`build` brackets itself with `scripts/record-build-inputs.mjs`: `--begin`, its
+first step, forgets the previous stamp and records a digest of the build's
+inputs (every file under `packages/paperclip-runner` except `dist`,
+`dist-browser`, `runner/target`, `node_modules` and dot-directories; every
+file under `packages/paperclip-eval-kernel` except `dist` and `node_modules`;
+every file under the root `patches` directory, which the acpx profile check
+hashes and the provider entrypoint bundler copies into `dist`; and the root
 `package.json`, `pnpm-lock.yaml`, `pnpm-workspace.yaml` and
-`tsconfig.base.json`) in
-`packages/paperclip-runner/node_modules/.cache/paperclip-runner-build-inputs.json`.
-`node server/scripts/prepare-runner-vendor.mjs` recomputes that digest and
-reuses the build when it matches the stamp and `dist/index.js`,
-`dist/live/index.js`, `dist/testing.js` and `dist/bin/paperclip-runnerd` all
-exist. Anything else (no stamp, a changed input, a missing output, a stamp from
-another platform) runs `pnpm --filter @paperclipai/paperclip-runner build`
-exactly as before, so a standalone `pnpm --filter @paperclipai/server build`
-on a fresh checkout still builds the Runner itself. Inside `pnpm build` the
-Runner has just been built by the same command, and the step skips a 12-16s
-rebuild. The step prints one `paperclip.runner-vendor.timing.v1` line saying
-which it did.
+`tsconfig.base.json`). `--finish`, its last step, recomputes the digest and
+writes the stamp
+`packages/paperclip-runner/node_modules/.cache/paperclip-runner-build-inputs.json`
+only if the inputs are still the ones the build began with, together with the
+path and size of every file under `dist`. An edit that lands while the build
+runs leaves no stamp, so the next consumer rebuilds.
+`node server/scripts/prepare-runner-vendor.mjs` reuses the build when the
+stamp is for this platform, every recorded output is still there at its
+recorded size, and the current digest matches. Anything else (no stamp, a
+changed input, a deleted or truncated output, a stamp from another platform)
+runs `pnpm --filter @paperclipai/paperclip-runner build` exactly as before, so
+a standalone `pnpm --filter @paperclipai/server build` on a fresh checkout
+still builds the Runner itself. Inside `pnpm build` the Runner has just been
+built by the same command, and the step skips a 12-16s rebuild. The step
+prints one `paperclip.runner-vendor.timing.v1` line saying which it did.
 
 Set `PAPERCLIP_RUNNER_VENDOR_REBUILD=1` to rebuild regardless of the stamp. A
-stamp is only written after a Runner build that passed every step, and the
-prepare step removes any existing stamp before it starts a rebuild, so a build
-that stops partway never leaves a stamp that vouches for it.
+stamp is only written after a Runner build that passed every step, and both
+the Runner's first build step and the prepare step remove any existing stamp
+before a rebuild starts, so a build that stops partway never leaves a stamp
+that vouches for it.
 
 ### Task search evaluation
 

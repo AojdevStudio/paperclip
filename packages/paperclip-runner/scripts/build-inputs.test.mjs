@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, stat, symlink, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -9,8 +9,11 @@ import { fileURLToPath } from "node:url";
 import {
   BUILD_INPUTS_SCHEMA,
   assessRunnerBuild,
+  beginRunnerBuild,
+  buildInputsPendingPath,
   buildInputsStampPath,
   collectBuildInputFiles,
+  collectBuildOutputFiles,
   computeBuildInputsDigest,
   expectedBuildOutputs,
   readBuildInputsStamp,
@@ -28,7 +31,11 @@ async function writeTree(root, files) {
   }
 }
 
-/** A throwaway repo with one Runner source file, one Rust source, built outputs, and the usual noise. */
+/**
+ * A throwaway repo with one Runner source file, one Rust source, two root
+ * patches, built outputs (the four every consumer reads plus one helper that
+ * is only opened by path), and the usual noise.
+ */
 async function makeRepo() {
   const repoRoot = await mkdtemp(path.join(tmpdir(), "runner-build-inputs-"));
   await writeTree(repoRoot, {
@@ -36,6 +43,8 @@ async function makeRepo() {
     "pnpm-lock.yaml": "lockfileVersion: 9\n",
     "pnpm-workspace.yaml": "packages:\n  - packages/*\n",
     "tsconfig.base.json": "{}\n",
+    "patches/acpx@0.13.1.patch": "--- a\n+++ b\n",
+    "patches/pi-acp@0.0.33.patch": "--- c\n+++ d\n",
     "packages/paperclip-runner/package.json": '{"name":"@paperclipai/paperclip-runner"}\n',
     "packages/paperclip-runner/src/index.ts": "export const one = 1;\n",
     "packages/paperclip-runner/runner/src/main.rs": "fn main() {}\n",
@@ -44,6 +53,7 @@ async function makeRepo() {
     "packages/paperclip-runner/dist/live/index.js": "export {};\n",
     "packages/paperclip-runner/dist/testing.js": "export {};\n",
     "packages/paperclip-runner/dist/bin/paperclip-runnerd": "binary\n",
+    "packages/paperclip-runner/dist/cli/acpx-runtime-sidecar.cjs": "module.exports = {};\n",
     "packages/paperclip-runner/dist-browser/index.js": "browser\n",
     "packages/paperclip-runner/node_modules/dep/index.js": "dep\n",
     "packages/paperclip-runner/.vite/cache.json": "{}\n",
@@ -54,6 +64,9 @@ async function makeRepo() {
   return { repoRoot, packageRoot };
 }
 
+const INPUT_FILE_COUNT = 10;
+const OUTPUT_FILE_COUNT = 5;
+
 async function withRepo(action) {
   const repo = await makeRepo();
   try {
@@ -63,7 +76,13 @@ async function withRepo(action) {
   }
 }
 
-test("the input set covers sources, the eval kernel and root config, and skips outputs and caches", async () => {
+/** A complete, undisturbed build: begin, (nothing changes), finish. */
+function recordCurrentBuild({ repoRoot, packageRoot, platform, arch, now }) {
+  beginRunnerBuild({ repoRoot, packageRoot, platform, arch, now });
+  return recordRunnerBuild({ repoRoot, packageRoot, platform, arch, now });
+}
+
+test("the input set covers sources, the eval kernel, root patches and root config, and skips outputs and caches", async () => {
   await withRepo(async ({ repoRoot }) => {
     const files = collectBuildInputFiles(repoRoot);
     assert.deepEqual(files, [
@@ -72,10 +91,27 @@ test("the input set covers sources, the eval kernel and root config, and skips o
       "packages/paperclip-runner/package.json",
       "packages/paperclip-runner/runner/src/main.rs",
       "packages/paperclip-runner/src/index.ts",
+      "patches/acpx@0.13.1.patch",
+      "patches/pi-acp@0.0.33.patch",
       "pnpm-lock.yaml",
       "pnpm-workspace.yaml",
       "tsconfig.base.json",
     ]);
+    assert.equal(files.length, INPUT_FILE_COUNT);
+  });
+});
+
+test("the output manifest lists every file under dist with its size, and nothing outside it", async () => {
+  await withRepo(async ({ packageRoot }) => {
+    const outputs = collectBuildOutputFiles(packageRoot);
+    assert.deepEqual(outputs, [
+      { path: "dist/bin/paperclip-runnerd", size: 7 },
+      { path: "dist/cli/acpx-runtime-sidecar.cjs", size: 21 },
+      { path: "dist/index.js", size: 22 },
+      { path: "dist/live/index.js", size: 11 },
+      { path: "dist/testing.js", size: 11 },
+    ]);
+    assert.equal(outputs.length, OUTPUT_FILE_COUNT);
   });
 });
 
@@ -83,12 +119,13 @@ test("the digest is stable, ignores outputs and caches, and tracks every kind of
   await withRepo(async ({ repoRoot }) => {
     const before = computeBuildInputsDigest(repoRoot);
     assert.equal(before.schema, BUILD_INPUTS_SCHEMA);
-    assert.equal(before.fileCount, 8);
+    assert.equal(before.fileCount, INPUT_FILE_COUNT);
     assert.equal(computeBuildInputsDigest(repoRoot).digest, before.digest, "two reads disagree");
 
     // Outputs, dependencies, caches and the Rust target directory may change freely.
     await writeTree(repoRoot, {
       "packages/paperclip-runner/dist/index.js": "export const one = 2;\n",
+      "packages/paperclip-runner/dist/cli/acpx-runtime-sidecar.cjs": "changed\n",
       "packages/paperclip-runner/dist-browser/index.js": "changed\n",
       "packages/paperclip-runner/node_modules/dep/index.js": "changed\n",
       "packages/paperclip-runner/.vite/cache.json": '{"changed":true}\n',
@@ -97,7 +134,8 @@ test("the digest is stable, ignores outputs and caches, and tracks every kind of
     });
     assert.equal(computeBuildInputsDigest(repoRoot).digest, before.digest, "an output changed the digest");
 
-    // Every input kind changes it: TypeScript, Rust, the eval kernel, root config, a new file, a rename.
+    // Every input kind changes it: TypeScript, Rust, the eval kernel, a root
+    // patch, root config, a new file, a rename.
     const seen = new Set([before.digest]);
     const expectChange = async (label, files) => {
       await writeTree(repoRoot, files);
@@ -108,6 +146,9 @@ test("the digest is stable, ignores outputs and caches, and tracks every kind of
     await expectChange("a Runner source", { "packages/paperclip-runner/src/index.ts": "export const one = 2;\n" });
     await expectChange("a Rust source", { "packages/paperclip-runner/runner/src/main.rs": "fn main() { }\n" });
     await expectChange("an eval-kernel source", { "packages/paperclip-eval-kernel/src/index.ts": "export const kernel = 2;\n" });
+    await expectChange("the pi-acp patch the build copies into dist", { "patches/pi-acp@0.0.33.patch": "--- c\n+++ d\n+e\n" });
+    await expectChange("the acpx patch the profile check hashes", { "patches/acpx@0.13.1.patch": "--- a\n+++ b\n+c\n" });
+    await expectChange("a new patch", { "patches/brace-expansion@5.0.9.patch": "--- x\n+++ y\n" });
     await expectChange("the lockfile", { "pnpm-lock.yaml": "lockfileVersion: 9\nchanged: true\n" });
     await expectChange("the base tsconfig", { "tsconfig.base.json": '{"compilerOptions":{}}\n' });
     await expectChange("a new file", { "packages/paperclip-runner/protocol/new.json": "{}\n" });
@@ -128,7 +169,7 @@ test("a symlink is hashed as its target path, not followed", async () => {
   });
 });
 
-test("a build is current only with a matching stamp and every consumer-facing output present", async () => {
+test("a build is current only with a matching stamp and every recorded output intact", async () => {
   await withRepo(async ({ repoRoot, packageRoot }) => {
     const platform = "linux";
     const arch = "x64";
@@ -137,24 +178,29 @@ test("a build is current only with a matching stamp and every consumer-facing ou
     assert.equal(assess().current, false);
     assert.equal(assess().code, "no_stamp");
 
-    const record = recordRunnerBuild({ repoRoot, packageRoot, platform, arch, now: () => new Date(0) });
+    const record = recordCurrentBuild({ repoRoot, packageRoot, platform, arch, now: () => new Date(0) });
+    assert.equal(record.recorded, true);
     assert.equal(record.stampPath, buildInputsStampPath(packageRoot));
-    assert.deepEqual(readBuildInputsStamp(record.stampPath), {
-      schema: BUILD_INPUTS_SCHEMA,
-      digest: record.digest,
-      fileCount: 8,
-      byteCount: record.byteCount,
-      platform,
-      arch,
-      recordedAt: "1970-01-01T00:00:00.000Z",
-    });
+    const stamp = readBuildInputsStamp(record.stampPath);
+    assert.equal(stamp.schema, BUILD_INPUTS_SCHEMA);
+    assert.equal(stamp.digest, record.digest);
+    assert.equal(stamp.fileCount, INPUT_FILE_COUNT);
+    assert.equal(stamp.byteCount, record.byteCount);
+    assert.equal(stamp.platform, platform);
+    assert.equal(stamp.arch, arch);
+    assert.equal(stamp.startedAt, "1970-01-01T00:00:00.000Z");
+    assert.equal(stamp.recordedAt, "1970-01-01T00:00:00.000Z");
+    assert.equal(stamp.outputCount, OUTPUT_FILE_COUNT);
+    assert.deepEqual(stamp.outputs, collectBuildOutputFiles(packageRoot));
     const current = assess();
     assert.equal(current.current, true, current.detail);
     assert.equal(current.code, "inputs_unchanged");
+    assert.match(current.detail, /10 files and 5 outputs checked/);
 
     assert.equal(assessRunnerBuild({ repoRoot, packageRoot, platform: "win32", arch }).code, "platform_mismatch");
     assert.equal(assessRunnerBuild({ repoRoot, packageRoot, platform, arch: "arm64" }).code, "platform_mismatch");
 
+    // The four outputs every consumer reads are checked by name.
     for (const output of expectedBuildOutputs(packageRoot, platform)) {
       const content = await readFile(output);
       await rm(output);
@@ -166,6 +212,30 @@ test("a build is current only with a matching stamp and every consumer-facing ou
     }
     assert.equal(assess().current, true);
 
+    // So is every other file the build left under dist: a helper that is only
+    // opened by path must be there, at the size the build wrote.
+    const helper = path.join(packageRoot, "dist", "cli", "acpx-runtime-sidecar.cjs");
+    const helperContent = await readFile(helper);
+    await rm(helper);
+    const gone = assess();
+    assert.equal(gone.current, false, "a missing helper still counted as current");
+    assert.equal(gone.code, "outputs_changed");
+    assert.match(gone.detail, /^build output dist\/cli\/acpx-runtime-sidecar\.cjs is missing since the build recorded at /);
+    await writeFile(helper, helperContent);
+    assert.equal(assess().current, true);
+
+    await truncate(helper, 3);
+    const truncated = assess();
+    assert.equal(truncated.current, false, "a truncated helper still counted as current");
+    assert.equal(truncated.code, "outputs_changed");
+    assert.match(truncated.detail, /^build output dist\/cli\/acpx-runtime-sidecar\.cjs is changed size since /);
+    await writeFile(helper, helperContent);
+    assert.equal(assess().current, true);
+
+    // A file the build did not produce may appear without invalidating it.
+    await writeFile(path.join(packageRoot, "dist", "extra.txt"), "later\n");
+    assert.equal(assess().current, true);
+
     await writeFile(path.join(packageRoot, "src", "index.ts"), "export const one = 3;\n");
     const changed = assess();
     assert.equal(changed.current, false);
@@ -173,24 +243,109 @@ test("a build is current only with a matching stamp and every consumer-facing ou
 
     await writeFile(record.stampPath, JSON.stringify({ ...readBuildInputsStamp(record.stampPath), schema: "other" }));
     assert.equal(assess().code, "schema_mismatch");
+    await writeFile(record.stampPath, JSON.stringify({ ...readBuildInputsStamp(record.stampPath), schema: BUILD_INPUTS_SCHEMA, outputs: undefined }));
+    assert.equal(assess().code, "schema_mismatch", "a stamp without an output manifest was trusted");
     await writeFile(record.stampPath, "not json");
     assert.equal(assess().code, "no_stamp");
   });
 });
 
-test("record-build-inputs.mjs writes the stamp for the package it is pointed at", async () => {
+test("an input edited while the build runs leaves no stamp, so the next consumer rebuilds", async () => {
   await withRepo(async ({ repoRoot, packageRoot }) => {
-    const { stdout } = await execFileAsync(process.execPath, [recordScript, "--package-root", packageRoot]);
+    const stampPath = buildInputsStampPath(packageRoot);
+    const pendingPath = buildInputsPendingPath(packageRoot);
+    const assess = () => assessRunnerBuild({ repoRoot, packageRoot });
+
+    // A previous good build, then a new build begins: the old stamp is gone at
+    // once, because the outputs are about to be replaced.
+    recordCurrentBuild({ repoRoot, packageRoot });
+    assert.equal(assess().current, true);
+    const pending = beginRunnerBuild({ repoRoot, packageRoot, now: () => new Date(1000) });
+    assert.equal(pending.pendingPath, pendingPath);
+    assert.equal(readBuildInputsStamp(stampPath), null, "the old stamp survived the start of a new build");
+    assert.equal(readBuildInputsStamp(pendingPath).digest, pending.digest);
+    assert.equal(assess().code, "no_stamp");
+
+    // The build "compiles" the old source, then an edit lands before it ends.
+    await writeFile(path.join(packageRoot, "src", "index.ts"), "export const one = 2;\n");
+    const result = recordRunnerBuild({ repoRoot, packageRoot });
+    assert.equal(result.recorded, false);
+    assert.equal(result.code, "inputs_changed_during_build");
+    assert.match(result.detail, /^inputs changed while the build ran \(digest [0-9a-f]{12} at start, [0-9a-f]{12} now\); the next consumer rebuilds$/);
+    assert.equal(result.startedAt, "1970-01-01T00:00:01.000Z");
+    assert.equal(readBuildInputsStamp(stampPath), null, "a stamp was written for a build whose inputs moved");
+    assert.equal(readBuildInputsStamp(pendingPath), null, "the pending record was left behind");
+    assert.equal(assess().code, "no_stamp");
+
+    // An undisturbed build records normally, and only the pending record's
+    // start time is kept.
+    const record = recordCurrentBuild({ repoRoot, packageRoot });
+    assert.equal(record.recorded, true);
+    assert.equal(readBuildInputsStamp(pendingPath), null);
+    assert.equal(assess().current, true);
+  });
+});
+
+test("a build that did not begin, or that left a required output missing, cannot be recorded", async () => {
+  await withRepo(async ({ repoRoot, packageRoot }) => {
+    const stampPath = buildInputsStampPath(packageRoot);
+
+    recordCurrentBuild({ repoRoot, packageRoot });
+    assert.throws(
+      () => recordRunnerBuild({ repoRoot, packageRoot }),
+      /no pending build inputs at .*paperclip-runner-build-inputs\.pending\.json: the Runner build must start with `node scripts\/record-build-inputs\.mjs --begin`/,
+    );
+    assert.equal(readBuildInputsStamp(stampPath), null, "the previous stamp outlived a build that did not begin");
+
+    beginRunnerBuild({ repoRoot, packageRoot });
+    await rm(path.join(packageRoot, "dist", "testing.js"));
+    assert.throws(
+      () => recordRunnerBuild({ repoRoot, packageRoot }),
+      /the Runner build finished without producing dist\/testing\.js/,
+    );
+    assert.equal(readBuildInputsStamp(stampPath), null);
+    assert.equal(assessRunnerBuild({ repoRoot, packageRoot }).code, "no_stamp");
+  });
+});
+
+test("record-build-inputs.mjs brackets the build for the package it is pointed at", async () => {
+  await withRepo(async ({ repoRoot, packageRoot }) => {
+    const run = (...args) => execFileAsync(process.execPath, [recordScript, ...args, "--package-root", packageRoot]);
     const expected = computeBuildInputsDigest(repoRoot);
-    assert.match(stdout, new RegExp(`^${BUILD_INPUTS_SCHEMA} recorded: digest=${expected.digest.slice(0, 12)} files=8 `));
+    const short = expected.digest.slice(0, 12);
+
+    // --finish before any --begin is a wiring error, not a silent stamp.
+    await assert.rejects(run("--finish"), /no pending build inputs/);
+    assert.equal(readBuildInputsStamp(buildInputsStampPath(packageRoot)), null);
+
+    const begin = await run("--begin");
+    assert.match(begin.stdout, new RegExp(`^${BUILD_INPUTS_SCHEMA} begin: digest=${short} files=${INPUT_FILE_COUNT} bytes=\\d+\n$`));
+    assert.equal(readBuildInputsStamp(buildInputsPendingPath(packageRoot)).digest, expected.digest);
+
+    const finish = await run("--finish");
+    assert.match(
+      finish.stdout,
+      new RegExp(`^${BUILD_INPUTS_SCHEMA} recorded: digest=${short} files=${INPUT_FILE_COUNT} bytes=\\d+ outputs=${OUTPUT_FILE_COUNT} stamp=node_modules/.cache/paperclip-runner-build-inputs.json\n$`),
+    );
     const stamp = readBuildInputsStamp(buildInputsStampPath(packageRoot));
     assert.equal(stamp.digest, expected.digest);
     assert.equal(stamp.platform, process.platform);
     assert.equal(stamp.arch, process.arch);
+    assert.equal(stamp.outputCount, OUTPUT_FILE_COUNT);
     assert.equal(assessRunnerBuild({ repoRoot, packageRoot }).current, true);
+    assert.equal((await stat(buildInputsStampPath(packageRoot))).isFile(), true);
 
+    // An edit between the two phases is reported and leaves nothing behind.
+    await run("--begin");
+    await writeFile(path.join(packageRoot, "src", "index.ts"), "export const one = 2;\n");
+    const moved = await run("--finish");
+    assert.match(moved.stdout, /^paperclip\.runner-build-inputs not recorded: inputs changed while the build ran /);
+    assert.equal(readBuildInputsStamp(buildInputsStampPath(packageRoot)), null);
+
+    await assert.rejects(run(), /one of --begin or --finish is required/);
+    await assert.rejects(run("--begin", "--finish"), /--finish cannot be combined with --begin/);
     await assert.rejects(
-      execFileAsync(process.execPath, [recordScript, "--bogus"]),
+      execFileAsync(process.execPath, [recordScript, "--begin", "--bogus"]),
       /unknown argument --bogus/,
     );
   });

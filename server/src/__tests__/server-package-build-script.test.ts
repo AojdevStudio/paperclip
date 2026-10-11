@@ -74,15 +74,21 @@ describe("server package build script", () => {
     );
   });
 
-  it("records the Runner's build inputs as the last step of its build", () => {
+  it("brackets the Runner's build with its input recording", () => {
     // The stamp prepare-runner-vendor.mjs trusts must only exist for a build
-    // that completed every step and check, so it has to be written last.
+    // that completed every step and check, so it has to be written last; and
+    // it must vouch for the inputs the build read, not for whatever the
+    // sources are when it ends, so the digest has to be captured before the
+    // first step reads anything (--begin) and compared again at the end
+    // (--finish). Nothing else in the chain may touch the stamp.
     const runner = JSON.parse(readFileSync(new URL(
       "../../../packages/paperclip-runner/package.json", import.meta.url,
     ), "utf8")) as { scripts: Record<string, string> };
     const steps = runner.scripts.build.split(" && ");
-    expect(steps.at(-1)).toBe("node scripts/record-build-inputs.mjs");
-    expect(steps.filter((step) => step.includes("record-build-inputs"))).toHaveLength(1);
+    expect(steps.at(0)).toBe("node scripts/record-build-inputs.mjs --begin");
+    expect(steps.at(-1)).toBe("node scripts/record-build-inputs.mjs --finish");
+    expect(steps.filter((step) => step.includes("record-build-inputs"))).toHaveLength(2);
+    expect(steps.length).toBeGreaterThan(2);
   });
 
   it("replaces an existing read-only image manifest with the build's copy step", () => {

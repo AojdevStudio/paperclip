@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
   assessRunnerBuild,
+  beginRunnerBuild,
   buildInputsStampPath,
   readBuildInputsStamp,
   recordRunnerBuild,
@@ -48,17 +49,25 @@ function makeRepo() {
     "pnpm-lock.yaml": "lockfileVersion: 9\n",
     "pnpm-workspace.yaml": "packages:\n  - packages/*\n  - server\n",
     "tsconfig.base.json": "{}\n",
+    "patches/acpx@0.13.1.patch": "--- a\n+++ b\n",
     "server/package.json": '{"name":"@paperclipai/server"}\n',
     "packages/paperclip-runner/package.json": '{"name":"@paperclipai/paperclip-runner"}\n',
     "packages/paperclip-runner/src/index.ts": "export const one = 1;\n",
     "packages/paperclip-runner/dist/index.js": "export const one = 1;\n",
     "packages/paperclip-runner/dist/live/index.js": "export {};\n",
     "packages/paperclip-runner/dist/testing.js": "export {};\n",
+    "packages/paperclip-runner/dist/cli/acpx-runtime-sidecar.cjs": "module.exports = {};\n",
     [`packages/paperclip-runner/dist/bin/${executable}`]: "binary\n",
     "packages/paperclip-eval-kernel/src/index.ts": "export const kernel = 1;\n",
   });
   const packageRoot = path.join(repoRoot, "packages", "paperclip-runner");
   return { repoRoot, packageRoot };
+}
+
+/** What the Runner's build does around its steps when nothing changes meanwhile. */
+function recordCurrentBuild({ repoRoot, packageRoot }) {
+  beginRunnerBuild({ repoRoot, packageRoot });
+  return recordRunnerBuild({ repoRoot, packageRoot });
 }
 
 afterEach(() => {
@@ -130,7 +139,7 @@ describe("prepareRunnerVendor", () => {
 
   it("skips the rebuild when the recorded build is current and reports the check time", () => {
     const { repoRoot, packageRoot } = makeRepo();
-    recordRunnerBuild({ repoRoot, packageRoot });
+    recordCurrentBuild({ repoRoot, packageRoot });
     const runs = [];
     const lines = [];
 
@@ -155,7 +164,7 @@ describe("prepareRunnerVendor", () => {
 
   it("rebuilds when the inputs changed, removing the stale stamp before the build starts", () => {
     const { repoRoot, packageRoot } = makeRepo();
-    recordRunnerBuild({ repoRoot, packageRoot });
+    recordCurrentBuild({ repoRoot, packageRoot });
     writeFileSync(path.join(packageRoot, "src", "index.ts"), "export const one = 2;\n");
     const stampPath = buildInputsStampPath(packageRoot);
     const observed = [];
@@ -182,6 +191,31 @@ describe("prepareRunnerVendor", () => {
     );
   });
 
+  it("rebuilds when a file the build left under dist is gone, even one no consumer imports", () => {
+    const { repoRoot, packageRoot } = makeRepo();
+    recordCurrentBuild({ repoRoot, packageRoot });
+    rmSync(path.join(packageRoot, "dist", "cli", "acpx-runtime-sidecar.cjs"));
+    let runs = 0;
+    const lines = [];
+
+    const status = prepareRunnerVendor({
+      repoRoot,
+      env: {},
+      run: () => {
+        runs += 1;
+        return 0;
+      },
+      log: (line) => lines.push(line),
+    });
+
+    expect(status).toBe(0);
+    expect(runs).toBe(1);
+    expect(lines[0]).toMatch(
+      /^prepare:runner-vendor: rebuilding the Runner \(build output dist\/cli\/acpx-runtime-sidecar\.cjs is missing since /,
+    );
+    expect(lines[1]).toMatch(/,action:rebuild,reason:outputs_changed,/);
+  });
+
   it("returns the build's failure status and leaves no stamp behind", () => {
     const { repoRoot, packageRoot } = makeRepo();
     const lines = [];
@@ -201,7 +235,7 @@ describe("prepareRunnerVendor", () => {
 
   it("rebuilds a current build when PAPERCLIP_RUNNER_VENDOR_REBUILD=1", () => {
     const { repoRoot, packageRoot } = makeRepo();
-    recordRunnerBuild({ repoRoot, packageRoot });
+    recordCurrentBuild({ repoRoot, packageRoot });
     let runs = 0;
     const lines = [];
 
@@ -221,12 +255,12 @@ describe("prepareRunnerVendor", () => {
   });
 
   it.skipIf(process.platform === "win32")(
-    "end to end: the first server build rebuilds the Runner, the second reuses it, a change rebuilds again",
+    "end to end: the first server build rebuilds the Runner, the second reuses it, a change or a lost output rebuilds again",
     async () => {
       const { repoRoot, packageRoot } = makeRepo();
       // A stand-in pnpm that behaves like the Runner build: it records how it
-      // was called, then records the build inputs the way the real build does
-      // as its final step.
+      // was called, then brackets its (empty) step list with the same two
+      // record-build-inputs.mjs calls the real build makes.
       const binDir = path.join(repoRoot, "bin");
       const argvLog = path.join(repoRoot, "pnpm-argv.log");
       mkdirSync(binDir);
@@ -237,7 +271,8 @@ describe("prepareRunnerVendor", () => {
           "#!/bin/sh",
           "set -e",
           `printf '%s\\n' "$*" >> "${argvLog}"`,
-          `"${process.execPath}" "${recordScript}" --package-root "${packageRoot}" > /dev/null`,
+          `"${process.execPath}" "${recordScript}" --begin --package-root "${packageRoot}" > /dev/null`,
+          `"${process.execPath}" "${recordScript}" --finish --package-root "${packageRoot}" > /dev/null`,
         ].join("\n")}\n`,
       );
       chmodSync(pnpm, 0o755);
@@ -262,6 +297,16 @@ describe("prepareRunnerVendor", () => {
       const third = await run();
       expect(calls()).toHaveLength(2);
       expect(third.stdout).toMatch(/action:rebuild,reason:inputs_changed,/);
+
+      rmSync(path.join(packageRoot, "dist", "cli", "acpx-runtime-sidecar.cjs"));
+      const fourth = await run();
+      expect(calls()).toHaveLength(3);
+      expect(fourth.stdout).toMatch(/action:rebuild,reason:outputs_changed,/);
+      // The stand-in build does not recreate the helper, so the new stamp's
+      // manifest no longer lists it and the next run reuses the build.
+      const fifth = await run();
+      expect(calls()).toHaveLength(3);
+      expect(fifth.stdout).toMatch(/action:reuse,reason:inputs_unchanged,/);
     },
   );
 });

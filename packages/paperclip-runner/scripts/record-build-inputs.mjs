@@ -1,15 +1,22 @@
-// Final step of the Runner package's `build`: records the digest of every
-// build input next to the outputs it produced, so server's
-// prepare:runner-vendor can reuse this build instead of repeating it when
-// nothing has changed. See build-inputs.mjs for what counts as an input.
+// Brackets the Runner package's `build` so server's prepare:runner-vendor can
+// reuse this build instead of repeating it when nothing has changed. See
+// build-inputs.mjs for what counts as an input and an output.
 //
-// Usage: node scripts/record-build-inputs.mjs [--package-root <dir>]
+//   --begin   first step of the build: forgets the previous stamp and records
+//             the inputs the build is about to read
+//   --finish  last step of the build, after every check: writes the stamp if
+//             the inputs are still the ones the build began with, with a
+//             manifest of every file under dist; otherwise writes nothing, so
+//             the next consumer rebuilds
+//
+// Usage: node scripts/record-build-inputs.mjs (--begin | --finish) [--package-root <dir>]
 // The package root defaults to this package; the flag exists for tests that
 // build a throwaway package layout.
 
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  beginRunnerBuild,
   recordRunnerBuild,
   repoRootFromRunnerPackage,
   runnerPackageRootFromScripts,
@@ -17,8 +24,14 @@ import {
 
 export function parseArguments(argv) {
   let packageRoot = null;
+  let phase = null;
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
+    if (argument === "--begin" || argument === "--finish") {
+      if (phase) throw new Error(`${argument} cannot be combined with --${phase}`);
+      phase = argument.slice(2);
+      continue;
+    }
     if (argument === "--package-root") {
       packageRoot = argv[index + 1];
       if (!packageRoot) throw new Error("--package-root needs a directory");
@@ -27,17 +40,32 @@ export function parseArguments(argv) {
     }
     throw new Error(`unknown argument ${argument}`);
   }
-  return { packageRoot };
+  if (!phase) throw new Error("one of --begin or --finish is required");
+  return { phase, packageRoot };
 }
 
 export function main(argv = process.argv.slice(2), log = console.log) {
-  const { packageRoot: requested } = parseArguments(argv);
+  const { phase, packageRoot: requested } = parseArguments(argv);
   const packageRoot = requested ? path.resolve(requested) : runnerPackageRootFromScripts();
   const repoRoot = repoRootFromRunnerPackage(packageRoot);
+
+  if (phase === "begin") {
+    const pending = beginRunnerBuild({ repoRoot, packageRoot });
+    log(
+      `${pending.schema} begin: digest=${pending.digest.slice(0, 12)} files=${pending.fileCount} ` +
+        `bytes=${pending.byteCount}`,
+    );
+    return pending;
+  }
+
   const record = recordRunnerBuild({ repoRoot, packageRoot });
+  if (!record.recorded) {
+    log(`${record.code === "inputs_changed_during_build" ? "paperclip.runner-build-inputs" : record.code} not recorded: ${record.detail}`);
+    return record;
+  }
   log(
     `${record.schema} recorded: digest=${record.digest.slice(0, 12)} files=${record.fileCount} ` +
-      `bytes=${record.byteCount} stamp=${path.relative(packageRoot, record.stampPath)}`,
+      `bytes=${record.byteCount} outputs=${record.outputCount} stamp=${path.relative(packageRoot, record.stampPath)}`,
   );
   return record;
 }
