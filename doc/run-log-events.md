@@ -5,6 +5,26 @@ Run-log events write to the `heartbeat_run_events` table
 Paperclip Telemetry events, and they are not OpenTelemetry exports. A run-log
 event needs no operator endpoint.
 
+## Diagnostic text credentials
+
+`server/src/redaction.ts` applies `redactSensitiveText` to diagnostic strings.
+The replacement is `***REDACTED***`. The text rules cover plain output and
+JSON-escaped output, including escaped line endings inside serialized events.
+
+- Unquoted credential header lines use the existing secret field names, plus
+  `CF-Access-Client-Id`, `X-API-Key`, `Api-Key`, `X-Auth-Token`, `Cookie`,
+  `Set-Cookie`, and `Proxy-Authorization`. A value follows `:` or `=` and ends
+  at a real or escaped line ending, or a quote. Basic and Bearer authorization
+  values use the existing authorization parser.
+- HTTP, HTTPS, WS, and WSS URLs mask query values named `key`, `token`, `secret`,
+  `auth`, `pass`, `password`, `sig`, `signature`, `credential`, or `code`.
+  Query values with unrelated names are not masked based on their length.
+- URL userinfo masks the password in `scheme://user:password@server` and keeps
+  the username and server address. An empty username is also supported.
+
+These rules mask credential shapes in text. They do not identify every possible
+secret or change files written by an external agent process.
+
 ## Native PRP Run-Log Events
 
 Fresh remote Codex model substitution emits `runner.model_fallback` on the

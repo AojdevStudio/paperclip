@@ -358,6 +358,20 @@ const ESCAPED_JSON_SECRET_FIELD_TEXT_RE = new RegExp(
   String.raw`((?:\\")?${SECRET_FIELD_NAME_PATTERN}(?:\\")?\s*:\s*(?:\\"))[^\\\r\n]+((?:\\"))`,
   "gi",
 );
+const SECRET_HEADER_NAME_PATTERN = String.raw`(?:${SECRET_FIELD_NAME_PATTERN}|CF-Access-Client-Id|X-API-Key|Api-Key|X-Auth-Token|Cookie|Set-Cookie|Proxy-Authorization)`;
+const UNQUOTED_SECRET_HEADER_TEXT_RE = new RegExp(
+  String.raw`((?:^|[\r\n"'` +
+    "`" +
+    String.raw`]|\\+[rn])[ \t]*(?![A-Za-z0-9_-]*Authorization[A-Za-z0-9_-]*[ \t]*[:=][ \t]*(?:Bearer|Basic)[ \t]+)${SECRET_HEADER_NAME_PATTERN}[ \t]*[:=][ \t]*)(?![ \t"'` +
+    "`" +
+    String.raw`]|\\+["'])(?:(?!\\+[rn"'])[^\r\n"'` +
+    "`" +
+    String.raw`])+`,
+  "gi",
+);
+const HTTP_URL_TEXT_RE = /\b(?:https?|wss?):\/\/(?:(?!\\+[rn"'])[^\s"'`<>])+/gi;
+const SECRET_URL_QUERY_TEXT_RE = /([?&](?:key|token|secret|auth|pass|password|sig|signature|credential|code)=)[^&#]*/gi;
+const URL_PASSWORD_TEXT_RE = /\b([a-z][a-z0-9+.-]*:\/\/[^\s/"'`<>:@?#\\]*:)(?:(?!\\+[rn"'])[^\s/"'`<>@?#])+@/gi;
 const SECRET_TEXT_HINTS = [
   "api",
   "key",
@@ -370,6 +384,7 @@ const SECRET_TEXT_HINTS = [
   "jwt",
   "private",
   "cookie",
+  "cf-access-client-id",
   "connectionstring",
   "sk-",
   "ghp_",
@@ -384,7 +399,8 @@ function maybeContainsSecretText(input: string) {
   const lower = input.toLowerCase();
   return (
     SECRET_TEXT_HINTS.some((hint) => lower.includes(hint)) ||
-    input.includes(".")
+    input.includes(".") ||
+    input.includes("://")
   );
 }
 
@@ -992,12 +1008,22 @@ export function redactAgentAdapterConfig(
 export function redactSensitiveText(input: string): string {
   if (!maybeContainsSecretText(input)) return input;
   return redactCommandText(
-    redactStandaloneBearerCredentials(redactAuthorizationCredentials(input))
+    redactStandaloneBearerCredentials(
+      redactAuthorizationCredentials(
+        input.replace(UNQUOTED_SECRET_HEADER_TEXT_RE, `$1${REDACTED_EVENT_VALUE}`),
+      ),
+    )
       .replace(JSON_SECRET_FIELD_TEXT_RE, `$1${REDACTED_EVENT_VALUE}$2`)
       .replace(
         ESCAPED_JSON_SECRET_FIELD_TEXT_RE,
         `$1${REDACTED_EVENT_VALUE}$2`,
       ),
     REDACTED_EVENT_VALUE,
-  );
+  )
+    .replace(HTTP_URL_TEXT_RE, (url) =>
+      url.replace(/^([^?#]*)(\?[^#]*)/, (_match, path: string, query: string) =>
+        path + query.replace(SECRET_URL_QUERY_TEXT_RE, `$1${REDACTED_EVENT_VALUE}`),
+      ),
+    )
+    .replace(URL_PASSWORD_TEXT_RE, `$1${REDACTED_EVENT_VALUE}@`);
 }
