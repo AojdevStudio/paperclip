@@ -475,6 +475,42 @@ jobs:
           # Restore only. Never let a pull request evict master's entry.
           save-if: false
 
+      # The Runner's own crate is the one thing the entry above leaves out:
+      # rust-cache drops workspace crates when it saves, and a fresh checkout
+      # would invalidate cargo's mtime fingerprints for them anyway. So this
+      # job compiled paperclip-runner-core in release mode on every run,
+      # 28-49s (runs 38169436532 to 38183149920, 2026-10-11), while 221 of
+      # the 239 master commits of the preceding week left its inputs alone.
+      # The master Rust lane in release-verify.yml saves that crate's release
+      # artifacts (about 70 MB) under a key made from the compiler, the
+      # checkout root and a hash of every input the build reads. A pull
+      # request whose merge tree carries byte-identical inputs restores them
+      # and marks them newer than the checkout, so cargo keeps them; any
+      # other pull request misses and compiles exactly as before. Exact key
+      # only: a prefix match would hand cargo another revision's output. The
+      # path list and the key live in scripts/runner-release-crate-cache.mjs
+      # and must match the writer's; a guard test holds them together.
+      - name: Compute the Runner release crate cache key
+        id: runner_release_crate_key
+        run: echo "scope=$(node scripts/runner-release-crate-cache.mjs scope)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the Runner release crate (read only)
+        id: runner_release_crate
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            packages/paperclip-runner/runner/target/release/.fingerprint/paperclip-runner-core-*
+            packages/paperclip-runner/runner/target/release/deps/libpaperclip_runner_core-*
+            packages/paperclip-runner/runner/target/release/deps/paperclip_runner_core-*.d
+            packages/paperclip-runner/runner/target/release/deps/paperclip_runnerd-*
+            packages/paperclip-runner/runner/target/release/paperclip-runnerd
+            packages/paperclip-runner/runner/target/release/paperclip-runnerd.d
+          key: runner-release-crate-v1-${{ steps.runner_release_crate_key.outputs.scope }}-${{ hashFiles('packages/paperclip-runner/rust-toolchain.toml', 'packages/paperclip-runner/runner/Cargo.toml', 'packages/paperclip-runner/runner/Cargo.lock', 'packages/paperclip-runner/runner/crates/**', 'packages/paperclip-runner/protocol/**', 'packages/paperclip-runner/test-fixtures/**', 'packages/paperclip-runner/test/fixtures/**') }}
+
+      - name: Mark the restored Runner release crate current
+        if: ${{ steps.runner_release_crate.outputs.cache-hit == 'true' }}
+        run: node scripts/runner-release-crate-cache.mjs mark-current
+
       - name: Typecheck workspaces whose build scripts skip TypeScript
         run: pnpm run typecheck:build-gaps
 
@@ -749,10 +785,12 @@ jobs:
             command: check:static
           - lane_label: rust
             command: check:runner
+            release_crate: true
           - lane_label: vitest 1/2
             command: test:typescript:vitest --shard=1/2
           - lane_label: vitest 2/2
             command: test:typescript:vitest --shard=2/2
+            release_crate: true
 
     steps:
       - name: Checkout repository
@@ -877,6 +915,49 @@ jobs:
           cache-bin: false
           # Restore only. Never let a pull request evict master's entry.
           save-if: false
+
+      # The Runner's own crate is the one thing the entry above leaves out:
+      # rust-cache drops workspace crates when it saves, and a fresh checkout
+      # would invalidate cargo's mtime fingerprints for them anyway. So this
+      # job compiled paperclip-runner-core in release mode on every run,
+      # 28-49s (runs 38169436532 to 38183149920, 2026-10-11), while 221 of
+      # the 239 master commits of the preceding week left its inputs alone.
+      # The master Rust lane in release-verify.yml saves that crate's release
+      # artifacts (about 70 MB) under a key made from the compiler, the
+      # checkout root and a hash of every input the build reads. A pull
+      # request whose merge tree carries byte-identical inputs restores them
+      # and marks them newer than the checkout, so cargo keeps them; any
+      # other pull request misses and compiles exactly as before. Exact key
+      # only: a prefix match would hand cargo another revision's output. The
+      # path list and the key live in scripts/runner-release-crate-cache.mjs
+      # and must match the writer's; a guard test holds them together.
+      #
+      # Only the lanes that build the release crate restore it: the Rust
+      # lane's release tests link the lib, and the final vitest shard hosts
+      # the server's native-runner suite, which builds the binary in its
+      # beforeAll. The static and first vitest lanes run no cargo at all.
+      - name: Compute the Runner release crate cache key
+        id: runner_release_crate_key
+        if: ${{ matrix.release_crate == true }}
+        run: echo "scope=$(node scripts/runner-release-crate-cache.mjs scope)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the Runner release crate (read only)
+        id: runner_release_crate
+        if: ${{ matrix.release_crate == true }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            packages/paperclip-runner/runner/target/release/.fingerprint/paperclip-runner-core-*
+            packages/paperclip-runner/runner/target/release/deps/libpaperclip_runner_core-*
+            packages/paperclip-runner/runner/target/release/deps/paperclip_runner_core-*.d
+            packages/paperclip-runner/runner/target/release/deps/paperclip_runnerd-*
+            packages/paperclip-runner/runner/target/release/paperclip-runnerd
+            packages/paperclip-runner/runner/target/release/paperclip-runnerd.d
+          key: runner-release-crate-v1-${{ steps.runner_release_crate_key.outputs.scope }}-${{ hashFiles('packages/paperclip-runner/rust-toolchain.toml', 'packages/paperclip-runner/runner/Cargo.toml', 'packages/paperclip-runner/runner/Cargo.lock', 'packages/paperclip-runner/runner/crates/**', 'packages/paperclip-runner/protocol/**', 'packages/paperclip-runner/test-fixtures/**', 'packages/paperclip-runner/test/fixtures/**') }}
+
+      - name: Mark the restored Runner release crate current
+        if: ${{ steps.runner_release_crate.outputs.cache-hit == 'true' }}
+        run: node scripts/runner-release-crate-cache.mjs mark-current
 
       - name: Verify Paperclip Runner
         # pnpm appends trailing args to the end of the script's shell chain,
@@ -1012,6 +1093,42 @@ jobs:
           cache-bin: false
           # Restore only. Never let a pull request evict master's entry.
           save-if: false
+
+      # The Runner's own crate is the one thing the entry above leaves out:
+      # rust-cache drops workspace crates when it saves, and a fresh checkout
+      # would invalidate cargo's mtime fingerprints for them anyway. So this
+      # job compiled paperclip-runner-core in release mode on every run,
+      # 28-49s (runs 38169436532 to 38183149920, 2026-10-11), while 221 of
+      # the 239 master commits of the preceding week left its inputs alone.
+      # The master Rust lane in release-verify.yml saves that crate's release
+      # artifacts (about 70 MB) under a key made from the compiler, the
+      # checkout root and a hash of every input the build reads. A pull
+      # request whose merge tree carries byte-identical inputs restores them
+      # and marks them newer than the checkout, so cargo keeps them; any
+      # other pull request misses and compiles exactly as before. Exact key
+      # only: a prefix match would hand cargo another revision's output. The
+      # path list and the key live in scripts/runner-release-crate-cache.mjs
+      # and must match the writer's; a guard test holds them together.
+      - name: Compute the Runner release crate cache key
+        id: runner_release_crate_key
+        run: echo "scope=$(node scripts/runner-release-crate-cache.mjs scope)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the Runner release crate (read only)
+        id: runner_release_crate
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            packages/paperclip-runner/runner/target/release/.fingerprint/paperclip-runner-core-*
+            packages/paperclip-runner/runner/target/release/deps/libpaperclip_runner_core-*
+            packages/paperclip-runner/runner/target/release/deps/paperclip_runner_core-*.d
+            packages/paperclip-runner/runner/target/release/deps/paperclip_runnerd-*
+            packages/paperclip-runner/runner/target/release/paperclip-runnerd
+            packages/paperclip-runner/runner/target/release/paperclip-runnerd.d
+          key: runner-release-crate-v1-${{ steps.runner_release_crate_key.outputs.scope }}-${{ hashFiles('packages/paperclip-runner/rust-toolchain.toml', 'packages/paperclip-runner/runner/Cargo.toml', 'packages/paperclip-runner/runner/Cargo.lock', 'packages/paperclip-runner/runner/crates/**', 'packages/paperclip-runner/protocol/**', 'packages/paperclip-runner/test-fixtures/**', 'packages/paperclip-runner/test/fixtures/**') }}
+
+      - name: Mark the restored Runner release crate current
+        if: ${{ steps.runner_release_crate.outputs.cache-hit == 'true' }}
+        run: node scripts/runner-release-crate-cache.mjs mark-current
 
       - name: Build Runner Evalbook viewer
         run: pnpm --filter @paperclipai/paperclip-runner build:issue-thread
@@ -1258,6 +1375,42 @@ jobs:
           cache-bin: false
           # Restore only. Never let a pull request evict master's entry.
           save-if: false
+
+      # The Runner's own crate is the one thing the entry above leaves out:
+      # rust-cache drops workspace crates when it saves, and a fresh checkout
+      # would invalidate cargo's mtime fingerprints for them anyway. So this
+      # job compiled paperclip-runner-core in release mode on every run,
+      # 28-49s (runs 38169436532 to 38183149920, 2026-10-11), while 221 of
+      # the 239 master commits of the preceding week left its inputs alone.
+      # The master Rust lane in release-verify.yml saves that crate's release
+      # artifacts (about 70 MB) under a key made from the compiler, the
+      # checkout root and a hash of every input the build reads. A pull
+      # request whose merge tree carries byte-identical inputs restores them
+      # and marks them newer than the checkout, so cargo keeps them; any
+      # other pull request misses and compiles exactly as before. Exact key
+      # only: a prefix match would hand cargo another revision's output. The
+      # path list and the key live in scripts/runner-release-crate-cache.mjs
+      # and must match the writer's; a guard test holds them together.
+      - name: Compute the Runner release crate cache key
+        id: runner_release_crate_key
+        run: echo "scope=$(node scripts/runner-release-crate-cache.mjs scope)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the Runner release crate (read only)
+        id: runner_release_crate
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            packages/paperclip-runner/runner/target/release/.fingerprint/paperclip-runner-core-*
+            packages/paperclip-runner/runner/target/release/deps/libpaperclip_runner_core-*
+            packages/paperclip-runner/runner/target/release/deps/paperclip_runner_core-*.d
+            packages/paperclip-runner/runner/target/release/deps/paperclip_runnerd-*
+            packages/paperclip-runner/runner/target/release/paperclip-runnerd
+            packages/paperclip-runner/runner/target/release/paperclip-runnerd.d
+          key: runner-release-crate-v1-${{ steps.runner_release_crate_key.outputs.scope }}-${{ hashFiles('packages/paperclip-runner/rust-toolchain.toml', 'packages/paperclip-runner/runner/Cargo.toml', 'packages/paperclip-runner/runner/Cargo.lock', 'packages/paperclip-runner/runner/crates/**', 'packages/paperclip-runner/protocol/**', 'packages/paperclip-runner/test-fixtures/**', 'packages/paperclip-runner/test/fixtures/**') }}
+
+      - name: Mark the restored Runner release crate current
+        if: ${{ steps.runner_release_crate.outputs.cache-hit == 'true' }}
+        run: node scripts/runner-release-crate-cache.mjs mark-current
 
       # `release.sh` always executes its Step 2/7 workspace build, even when
       # `--skip-verify` bypasses the initial verification gate. release.sh
