@@ -48,8 +48,9 @@ export const CACHED_PATHS = [
 // Every file the release build of the crate reads, as hashFiles() patterns:
 // the toolchain pin, the manifests and lockfile, the crate sources, and the
 // protocol schemas and fixtures the sources include with include_str!. The
-// two fixture trees are read only by test builds, but hashing them costs
-// nothing and keeps the include_str! guard test simple.
+// three fixture trees are read only by test builds, but hashing them costs
+// nothing and keeps the include_str! guard test simple: every include in the
+// crate, whatever its form, must land under one of these patterns.
 export const HASHED_INPUTS = [
   `${RUNNER_PACKAGE}/rust-toolchain.toml`,
   `${RUNNER_PACKAGE}/runner/Cargo.toml`,
@@ -58,15 +59,26 @@ export const HASHED_INPUTS = [
   `${RUNNER_PACKAGE}/protocol/**`,
   `${RUNNER_PACKAGE}/test-fixtures/**`,
   `${RUNNER_PACKAGE}/test/fixtures/**`,
+  "tests/runner-e2e/fixtures/**",
 ];
 
-// A restored set is usable only when both units are complete. Anything less
-// is discarded so cargo sees a plain miss rather than a half-restored crate.
-const REQUIRED = [
-  { label: "the uplifted binary", glob: `${RELEASE_DIR}/paperclip-runnerd` },
+// A restored set is usable only when both units are complete: everything
+// cargo's freshness check reads for a unit (the fingerprint hash and the
+// dep-info it compares source mtimes against) and every output it checks for
+// (the lib's rlib and rmeta, the bin under deps). Measured with cargo 1.97.1:
+// without any one of these it recompiles the unit; without the `.json`
+// fingerprint records, rustc's `.d` files or the uplifted binary and its `.d`
+// it reports the crate fresh and recreates the uplifted copy from deps.
+// Anything less than this set is discarded, with the missing file named in
+// the job log, so cargo sees a plain miss rather than a half-restored crate.
+export const REQUIRED = [
+  { label: "the lib fingerprint hash", glob: `${RELEASE_DIR}/.fingerprint/paperclip-runner-core-*/lib-paperclip_runner_core` },
+  { label: "the lib dep-info", glob: `${RELEASE_DIR}/.fingerprint/paperclip-runner-core-*/dep-lib-paperclip_runner_core` },
   { label: "the lib rlib", glob: `${RELEASE_DIR}/deps/libpaperclip_runner_core-*.rlib` },
-  { label: "the lib fingerprint", glob: `${RELEASE_DIR}/.fingerprint/paperclip-runner-core-*/lib-paperclip_runner_core` },
-  { label: "the bin fingerprint", glob: `${RELEASE_DIR}/.fingerprint/paperclip-runner-core-*/bin-paperclip-runnerd` },
+  { label: "the lib rmeta", glob: `${RELEASE_DIR}/deps/libpaperclip_runner_core-*.rmeta` },
+  { label: "the bin fingerprint hash", glob: `${RELEASE_DIR}/.fingerprint/paperclip-runner-core-*/bin-paperclip-runnerd` },
+  { label: "the bin dep-info", glob: `${RELEASE_DIR}/.fingerprint/paperclip-runner-core-*/dep-bin-paperclip-runnerd` },
+  { label: "the bin under deps", glob: `${RELEASE_DIR}/deps/paperclip_runnerd-*`, exclude: /\.d$/ },
 ];
 
 const SCHEMA = "paperclip.runner-release-crate.v1";
@@ -143,7 +155,7 @@ function walk(target, visit) {
  * restored and report it: cargo then compiles the crate as on a miss.
  */
 export function markCurrent({ root = process.env.GITHUB_WORKSPACE ?? process.cwd(), now = new Date() } = {}) {
-  const missing = REQUIRED.find(({ glob }) => expandGlob(root, glob).length === 0);
+  const missing = REQUIRED.find(({ glob, exclude }) => expandGlob(root, glob).filter((entry) => !exclude?.test(entry)).length === 0);
   const matched = CACHED_PATHS.flatMap((pattern) => expandGlob(root, pattern));
   if (missing) {
     for (const target of matched) rmSync(target, { recursive: true, force: true });

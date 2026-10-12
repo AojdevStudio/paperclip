@@ -390,10 +390,14 @@ host) and a hash of the checkout root, because cargo's dep-info records the
 protocol files the crate includes by relative path as absolute paths. The
 `hashFiles` part covers every input the build reads: the toolchain pin, the
 manifests and lockfile, the crate sources, the protocol schemas and fixtures,
-and the two fixture trees the test modules include. Any change to any of them
-selects a new key. Readers
-pass no `restore-keys`: a prefix match would hand cargo another revision's
-output.
+and the three fixture trees the test modules include (two under the Runner
+package and `tests/runner-e2e/fixtures` at the repository root). Any change
+to any of them selects a new key. A guard test resolves every `include_str!`
+and `include_bytes!` in the crate, whether its argument is a literal or a
+`concat!` of literals, `env!("CARGO_MANIFEST_DIR")` and macro metavariables,
+and fails on an include that lands outside these patterns or uses a form it
+cannot resolve. Readers pass no `restore-keys`: a prefix match would hand
+cargo another revision's output.
 
 The writer is the Rust lane of the same master-push verification, after its
 checks and the debug warm-up. It looks the key up first and, on a miss, runs
@@ -404,8 +408,13 @@ Build and Canary Dry Run jobs and the two Verify Paperclip Runner lanes that
 build the crate (`rust` and the final vitest shard) restore the entry
 read-only right after the dependency restore. On a hit, `mark-current` sets
 the mtime of every restored artifact to now, so cargo's freshness check sees
-every source as older than the build and keeps the artifacts; an incomplete
-restore is removed instead, and cargo compiles as on a miss. `pnpm build`
+every source as older than the build and keeps the artifacts. A restore that
+lacks any file cargo reads or checks for either unit (the fingerprint hash
+and dep-info of each unit, the lib's rlib and rmeta, the binary under
+`deps`; measured with cargo 1.97.1, which recompiles without any one of
+them and recreates the uplifted binary without any of the rest) is removed
+instead, the job log names the missing file, and cargo compiles as on a
+miss. `pnpm build`
 then prints `Finished release profile` in well under a second for that crate.
 On a miss nothing changes: cargo compiles the crate as before.
 

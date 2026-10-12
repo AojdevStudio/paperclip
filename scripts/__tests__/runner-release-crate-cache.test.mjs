@@ -6,7 +6,7 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { CACHED_PATHS, HASHED_INPUTS, RUNNER_PACKAGE, computeScope, markCurrent } from "../runner-release-crate-cache.mjs";
+import { CACHED_PATHS, HASHED_INPUTS, REQUIRED, RUNNER_PACKAGE, computeScope, markCurrent } from "../runner-release-crate-cache.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const script = path.join(repoRoot, "scripts/runner-release-crate-cache.mjs");
@@ -85,6 +85,7 @@ test("the script's path list and key inputs cover what the release build of the 
     `${RUNNER_PACKAGE}/protocol/**`,
     `${RUNNER_PACKAGE}/test-fixtures/**`,
     `${RUNNER_PACKAGE}/test/fixtures/**`,
+    "tests/runner-e2e/fixtures/**",
   ]);
   for (const input of HASHED_INPUTS) {
     const fixed = input.replace(/\/\*\*$/, "");
@@ -96,9 +97,161 @@ test("the script's path list and key inputs cover what the release build of the 
   assert.ok(CACHED_PATHS.includes(`${RELEASE_DIR}/paperclip-runnerd`));
 });
 
+// Every `include_str!` / `include_bytes!` in one Rust source, with the path
+// each one names. Three argument forms are resolved: a string literal
+// (relative to the source file), and `concat!(...)` of string literals,
+// `env!("CARGO_MANIFEST_DIR")` (the directory of the nearest Cargo.toml) and
+// macro metavariables (`$name`, which make the resolved path a directory
+// prefix rather than a file). Anything else is reported as unsupported, so
+// a new include form cannot slip past the guard by not matching a regex.
+function crateIncludes(source, text) {
+  const includes = [];
+  for (const match of text.matchAll(/include_(?:str|bytes)!\s*\(/g)) {
+    const start = match.index + match[0].length;
+    let depth = 1;
+    let inString = false;
+    let end = start;
+    for (; end < text.length && depth > 0; end += 1) {
+      const ch = text[end];
+      if (inString) {
+        if (ch === "\\") end += 1;
+        else if (ch === '"') inString = false;
+      } else if (ch === '"') inString = true;
+      else if (ch === "(") depth += 1;
+      else if (ch === ")") depth -= 1;
+    }
+    assert.equal(depth, 0, `${source}: unbalanced include at offset ${match.index}`);
+    const argument = text.slice(start, end - 1).trim();
+    includes.push({ argument, ...resolveIncludeArgument(source, argument) });
+  }
+  return includes;
+}
+
+function manifestDir(source) {
+  let dir = path.dirname(source);
+  while (!statSync(path.join(dir, "Cargo.toml"), { throwIfNoEntry: false })?.isFile()) {
+    const parent = path.dirname(dir);
+    assert.notEqual(parent, dir, `${source}: no Cargo.toml above the source`);
+    dir = parent;
+  }
+  return dir;
+}
+
+function resolveIncludeArgument(source, argument) {
+  const literal = argument.match(/^"((?:[^"\\]|\\.)*)"$/);
+  if (literal) return { form: "literal", resolved: path.resolve(path.dirname(source), literal[1]), exact: true };
+
+  const concat = argument.match(/^concat!\s*\(([\s\S]*)\)$/);
+  assert.ok(concat, `${source}: unsupported include form: ${argument}`);
+  const parts = splitTopLevel(concat[1]);
+  // A relative path is joined to the source's directory; one that starts
+  // with the manifest directory is one string, since its next literal
+  // starts with the "/" that separates the two.
+  let base = `${path.dirname(source)}/`;
+  let text = "";
+  let exact = true;
+  let form = "concat";
+  for (const [index, part] of parts.entries()) {
+    const string = part.match(/^"((?:[^"\\]|\\.)*)"$/);
+    if (string) {
+      assert.ok(exact || !/(^|\/)\.\.(\/|$)/.test(string[1]), `${source}: a path segment after a metavariable must not climb out: ${argument}`);
+      if (exact) text += string[1];
+      continue;
+    }
+    if (part === 'env!("CARGO_MANIFEST_DIR")') {
+      assert.equal(index, 0, `${source}: env!("CARGO_MANIFEST_DIR") must be the first part of concat!: ${argument}`);
+      base = manifestDir(source);
+      form = "concat-manifest-dir";
+      continue;
+    }
+    if (/^\$[A-Za-z_][A-Za-z0-9_]*$/.test(part)) {
+      // The fixed prefix before the first metavariable is the directory the
+      // macro's callers can reach; the suffix cannot climb out of it.
+      exact = false;
+      form = form === "concat-manifest-dir" ? form : "concat-metavariable";
+      continue;
+    }
+    assert.fail(`${source}: unsupported concat! part in include: ${part}`);
+  }
+  const joined = base + text;
+  const resolved = path.resolve(exact || text.endsWith("/") ? joined : path.dirname(joined));
+  return { form, resolved, exact };
+}
+
+// Split concat!'s arguments on the commas outside string literals.
+function splitTopLevel(text) {
+  const parts = [];
+  let current = "";
+  let inString = false;
+  for (let index = 0; index < text.length; index += 1) {
+    const ch = text[index];
+    if (inString) {
+      current += ch;
+      if (ch === "\\") current += text[++index] ?? "";
+      else if (ch === '"') inString = false;
+    } else if (ch === '"') {
+      inString = true;
+      current += ch;
+    } else if (ch === ",") {
+      parts.push(current);
+      current = "";
+    } else current += ch;
+  }
+  parts.push(current);
+  return parts.map((part) => part.trim()).filter(Boolean);
+}
+
+const underHashedInputs = (resolved) =>
+  HASHED_INPUTS.map((input) => path.join(repoRoot, input.replace(/\/\*\*$/, ""))).some((root) => resolved === root || resolved.startsWith(`${root}${path.sep}`));
+
+test("the include parser resolves literals, concat! with the manifest directory and with metavariables, and rejects other forms", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "runner-release-crate-includes-"));
+  try {
+    const crate = path.join(root, "crates/demo");
+    mkdirSync(path.join(crate, "src/nested"), { recursive: true });
+    mkdirSync(path.join(root, "protocol/fixtures"), { recursive: true });
+    writeFileSync(path.join(crate, "Cargo.toml"), '[package]\nname = "demo"\n');
+    writeFileSync(path.join(root, "protocol/schema.json"), "{}");
+    const source = path.join(crate, "src/nested/mod.rs");
+    const text = [
+      'let a = include_str!("../../../../protocol/schema.json");',
+      'let b = include_bytes!(\n    "../../../../protocol/schema.json"\n);',
+      'let c = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../protocol/", "schema.json"));',
+      'let d = include_str!(concat!("../../../../protocol/fixtures/", $fixture, ".json"));',
+      'let e = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../protocol/fixtures/", $golden, ".summary.json"));',
+      'let f = include_str!("a (paren) in the name.json");',
+    ].join("\n");
+    const includes = crateIncludes(source, text);
+    assert.deepEqual(
+      includes.map(({ form, resolved, exact }) => [form, path.relative(root, resolved), exact]),
+      [
+        ["literal", "protocol/schema.json", true],
+        ["literal", "protocol/schema.json", true],
+        ["concat-manifest-dir", "protocol/schema.json", true],
+        ["concat-metavariable", "protocol/fixtures", false],
+        ["concat-manifest-dir", "protocol/fixtures", false],
+        ["literal", "crates/demo/src/nested/a (paren) in the name.json", true],
+      ],
+    );
+
+    const rejected = [
+      'include_str!(concat!("../protocol/", $x, "/../../../outside.json"))',
+      'include_str!(concat!("../protocol/", env!("CARGO_MANIFEST_DIR")))',
+      'include_str!(concat!(env!("OTHER_DIR"), "/schema.json"))',
+      'include_str!(r"../protocol/schema.json")',
+      'include_str!(path_from_a_function())',
+      'include_str!(concat!("../protocol/", some_macro!("x")))',
+    ];
+    for (const argument of rejected) {
+      assert.throws(() => crateIncludes(source, argument), /unsupported|must not climb out|must be the first part/, argument);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("every file the crate includes by path sits under a hashed input, so an edit to it changes the key", () => {
   const crateRoot = path.join(repoRoot, RUNNER_PACKAGE, "runner/crates");
-  const hashedRoots = HASHED_INPUTS.map((input) => path.join(repoRoot, input.replace(/\/\*\*$/, "")));
   const sources = [];
   (function walk(dir) {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
@@ -108,20 +261,22 @@ test("every file the crate includes by path sits under a hashed input, so an edi
     }
   })(crateRoot);
   assert.ok(sources.length > 10, "the crate sources must be found");
+  const forms = new Set();
   let includes = 0;
   for (const source of sources) {
-    const text = readFileSync(source, "utf8");
-    for (const [, literal] of text.matchAll(/include_(?:str|bytes)!\(\s*"([^"]+)"/g)) {
+    for (const { argument, form, resolved, exact } of crateIncludes(source, readFileSync(source, "utf8"))) {
       includes += 1;
-      const resolved = path.resolve(path.dirname(source), literal);
-      assert.ok(
-        hashedRoots.some((root) => resolved === root || resolved.startsWith(`${root}${path.sep}`)),
-        `${path.relative(repoRoot, source)} includes ${literal}, which no HASHED_INPUTS pattern covers`,
-      );
-      assert.ok(statSync(resolved).isFile(), `${literal} must exist`);
+      forms.add(form);
+      const where = `${path.relative(repoRoot, source)} includes ${argument.replace(/\s+/g, " ")}`;
+      assert.ok(underHashedInputs(resolved), `${where}, which resolves to ${path.relative(repoRoot, resolved)}, outside every HASHED_INPUTS pattern`);
+      const info = statSync(resolved, { throwIfNoEntry: false });
+      assert.ok(exact ? info?.isFile() : info?.isDirectory(), `${where}: ${path.relative(repoRoot, resolved)} must exist`);
     }
   }
   assert.ok(includes > 0, "the crate includes protocol files by path; the guard must see them");
+  // The crate uses every supported form today, so none of the parser's
+  // branches is exercised only by the synthetic test above.
+  assert.deepEqual([...forms].sort(), ["concat-manifest-dir", "concat-metavariable", "literal"]);
 });
 
 test("every PR reader restores the crate after the dependency cache and marks it before building", () => {
@@ -242,7 +397,7 @@ test("the scope names the platform, the compiler and the checkout root, and surv
 
 // The tree cargo leaves behind for the crate's release lib and bin units,
 // with the mtimes GitHub's cache restores: older than a fresh checkout.
-function layRestoredCrate(root, { withRlib = true } = {}) {
+function layRestoredCrate(root) {
   const release = path.join(root, RELEASE_DIR);
   const lib = path.join(release, ".fingerprint/paperclip-runner-core-0b6c4654c2710743");
   const bin = path.join(release, ".fingerprint/paperclip-runner-core-46cce78dbc4840c2");
@@ -257,6 +412,7 @@ function layRestoredCrate(root, { withRlib = true } = {}) {
     [path.join(bin, "bin-paperclip-runnerd")]: "fedcba9876543210",
     [path.join(bin, "bin-paperclip-runnerd.json")]: "{}",
     [path.join(bin, "dep-bin-paperclip-runnerd")]: "dep",
+    [path.join(release, "deps/libpaperclip_runner_core-0b6c4654c2710743.rlib")]: "rlib",
     [path.join(release, "deps/libpaperclip_runner_core-0b6c4654c2710743.rmeta")]: "rmeta",
     [path.join(release, "deps/paperclip_runner_core-0b6c4654c2710743.d")]: "d",
     [path.join(release, "deps/paperclip_runnerd-46cce78dbc4840c2")]: "ELF",
@@ -266,7 +422,6 @@ function layRestoredCrate(root, { withRlib = true } = {}) {
     // A dependency's artifacts sit beside the crate's and must not be touched.
     [path.join(release, "deps/libserde-1234567890abcdef.rlib")]: "dep rlib",
   };
-  if (withRlib) files[path.join(release, "deps/libpaperclip_runner_core-0b6c4654c2710743.rlib")] = "rlib";
   const old = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
   for (const [file, content] of Object.entries(files)) {
     writeFileSync(file, content);
@@ -310,29 +465,85 @@ test("mark-current makes every restored artifact newer than the checkout and lea
   }
 });
 
-test("mark-current discards an incomplete restore so cargo sees a plain miss", () => {
+// One file per REQUIRED entry, as cargo 1.97.1 lays them out for the crate's
+// release lib and bin units. Measured: without any one of these cargo
+// recompiles the unit (the whole crate for a lib file, a relink for a bin
+// file); without any of the files in NOT_NEEDED it reports the crate fresh
+// and recreates the uplifted binary from the one under deps.
+const REQUIRED_FILES = {
+  "the lib fingerprint hash": ".fingerprint/paperclip-runner-core-0b6c4654c2710743/lib-paperclip_runner_core",
+  "the lib dep-info": ".fingerprint/paperclip-runner-core-0b6c4654c2710743/dep-lib-paperclip_runner_core",
+  "the lib rlib": "deps/libpaperclip_runner_core-0b6c4654c2710743.rlib",
+  "the lib rmeta": "deps/libpaperclip_runner_core-0b6c4654c2710743.rmeta",
+  "the bin fingerprint hash": ".fingerprint/paperclip-runner-core-46cce78dbc4840c2/bin-paperclip-runnerd",
+  "the bin dep-info": ".fingerprint/paperclip-runner-core-46cce78dbc4840c2/dep-bin-paperclip-runnerd",
+  "the bin under deps": "deps/paperclip_runnerd-46cce78dbc4840c2",
+};
+const NOT_NEEDED = [
+  ".fingerprint/paperclip-runner-core-0b6c4654c2710743/lib-paperclip_runner_core.json",
+  ".fingerprint/paperclip-runner-core-0b6c4654c2710743/invoked.timestamp",
+  ".fingerprint/paperclip-runner-core-46cce78dbc4840c2/bin-paperclip-runnerd.json",
+  "deps/paperclip_runner_core-0b6c4654c2710743.d",
+  "deps/paperclip_runnerd-46cce78dbc4840c2.d",
+  "paperclip-runnerd",
+  "paperclip-runnerd.d",
+];
+
+test("mark-current discards a restore that lacks any file cargo needs for either unit, naming the file, so cargo sees a plain miss", () => {
+  assert.deepEqual(REQUIRED.map(({ label }) => label), Object.keys(REQUIRED_FILES), "every REQUIRED entry has a missing-file case");
+  for (const [label, file] of Object.entries(REQUIRED_FILES)) {
+    const root = mkdtempSync(path.join(os.tmpdir(), "runner-release-crate-"));
+    try {
+      const { release } = layRestoredCrate(root);
+      rmSync(path.join(release, file));
+      const result = markCurrent({ root });
+      assert.equal(result.action, "discarded", `${file} missing must discard the restore`);
+      assert.equal(result.reason, `incomplete: ${label} is missing`);
+      assert.ok(result.removed > 0, label);
+      assert.deepEqual(readdirSync(path.join(release, ".fingerprint")), [], label);
+      assert.deepEqual(readdirSync(path.join(release, "deps")), ["libserde-1234567890abcdef.rlib"], `${label}: only the crate's own artifacts are removed`);
+      assert.deepEqual(readdirSync(release).sort(), [".fingerprint", "deps"], label);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  // The bin's dep-info alone does not stand in for the bin: the glob that
+  // finds the binary under deps must not be satisfied by the `.d` beside it.
   const root = mkdtempSync(path.join(os.tmpdir(), "runner-release-crate-"));
   try {
-    const { release } = layRestoredCrate(root, { withRlib: false });
-    const result = markCurrent({ root });
-    assert.equal(result.action, "discarded");
-    assert.match(result.reason, /the lib rlib is missing/);
-    assert.ok(result.removed > 0);
-    assert.deepEqual(readdirSync(path.join(release, ".fingerprint")), []);
-    assert.deepEqual(readdirSync(path.join(release, "deps")), ["libserde-1234567890abcdef.rlib"], "only the crate's own artifacts are removed");
-    assert.deepEqual(readdirSync(release).sort(), [".fingerprint", "deps"]);
-
-    // Nothing restored at all is reported the same way and exits cleanly.
-    const empty = mkdtempSync(path.join(os.tmpdir(), "runner-release-crate-empty-"));
-    try {
-      const printed = JSON.parse(execFileSync(process.execPath, [script, "mark-current"], { encoding: "utf8", env: { ...process.env, GITHUB_WORKSPACE: empty } }));
-      assert.equal(printed.action, "discarded");
-      assert.equal(printed.removed, 0);
-    } finally {
-      rmSync(empty, { recursive: true, force: true });
-    }
+    const { release } = layRestoredCrate(root);
+    rmSync(path.join(release, "deps/paperclip_runnerd-46cce78dbc4840c2"));
+    assert.ok(statSync(path.join(release, "deps/paperclip_runnerd-46cce78dbc4840c2.d")).isFile());
+    assert.equal(markCurrent({ root }).reason, "incomplete: the bin under deps is missing");
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+
+  // A file cargo neither reads nor checks for may be absent without costing
+  // a rebuild, so its absence must not cost one here either.
+  for (const file of NOT_NEEDED) {
+    const intact = mkdtempSync(path.join(os.tmpdir(), "runner-release-crate-"));
+    try {
+      const { release } = layRestoredCrate(intact);
+      rmSync(path.join(release, file));
+      const result = markCurrent({ root: intact });
+      assert.equal(result.action, "marked", `${file} missing must not discard the restore`);
+      assert.equal(result.files, 13, file);
+    } finally {
+      rmSync(intact, { recursive: true, force: true });
+    }
+  }
+
+  // Nothing restored at all is reported the same way and exits cleanly.
+  const empty = mkdtempSync(path.join(os.tmpdir(), "runner-release-crate-empty-"));
+  try {
+    const printed = JSON.parse(execFileSync(process.execPath, [script, "mark-current"], { encoding: "utf8", env: { ...process.env, GITHUB_WORKSPACE: empty } }));
+    assert.equal(printed.action, "discarded");
+    assert.equal(printed.reason, "incomplete: the lib fingerprint hash is missing");
+    assert.equal(printed.removed, 0);
+  } finally {
+    rmSync(empty, { recursive: true, force: true });
   }
 });
 
